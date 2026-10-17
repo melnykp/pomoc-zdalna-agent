@@ -1,38 +1,73 @@
-// Package remote nadzoruje moduł pulpitu (własna kompilacja RustDesk) i realizuje
-// przebieg „Połącz” z docs/ARCHITECTURE.md: hasło jednorazowe per sesja, whitelist
-// identyfikatorów inżynierów, zgłaszanie stanu sesji.
+// Package remote nadzoruje moduł pulpitu (klient RustDesk instalowany i konfigurowany przez agenta) i realizuje przebieg
+// „Połącz” (docs/adr/0008-sterowanie-zdalne-rustdesk.md): hasło jednorazowe per sesja, zamknięcie dostępu po sesji,
+// zgłaszanie stanu sesji.
 //
-// Szkielet: interfejs modułu, model sesji i generator OTP. Implementacja na rustdesk.exe
-// wymaga potwierdzenia flag CLI i nazw opcji na bieżącej wersji.
+// Komputer jest „zamknięty”: RustDesk ma ustawione losowe hasło, którego nikt nie zna. Sesja zaczyna się od polecenia
+// remote.open: agent ustawia nowe hasło jednorazowe (OTP) i odsyła je razem z identyfikatorem RustDesk. Po rozłączeniu
+// albo po upływie czasu życia hasła agent zamyka dostęp z powrotem.
 package remote
 
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"math/big"
 	"time"
 )
 
-// Module to sterowanie procesem pulpitu.
+// Module to sterowanie klientem pulpitu na tym komputerze.
 type Module interface {
-	// ID zwraca identyfikator RustDesk urządzenia.
+	// Installed mówi, czy klient pulpitu jest zainstalowany.
+	Installed() bool
+	// ID zwraca identyfikator RustDesk tego komputera.
 	ID(ctx context.Context) (string, error)
-	// SetPassword ustawia hasło stałe (OTP sesji albo losowe „zamknięcie”).
+	// SetPassword ustawia hasło stałe klienta (OTP sesji albo losowe hasło zamykające).
 	SetPassword(ctx context.Context, password string) error
-	// EnsureConfig wymusza opcje z defaults.toml i listę dozwolonych inżynierów.
-	EnsureConfig(ctx context.Context, whitelist []string) error
-	// Running mówi, czy usługa modułu działa.
-	Running(ctx context.Context) (bool, error)
+	// EnsureConfig wymusza adres naszego serwera i bezpieczne opcje klienta (patrz DefaultOptions).
+	EnsureConfig(ctx context.Context) error
+	// Running mówi, czy usługa klienta działa.
+	Running(ctx context.Context) bool
+	// Connected mówi, czy w tej chwili trwa połączenie przychodzące.
+	Connected(ctx context.Context) (bool, error)
 }
 
-// Session to jedna sesja zdalna od remote.open do rozłączenia.
+// Installer to moduł, który potrafi zainstalować klienta z pliku (RustDesk).
+type Installer interface {
+	Install(ctx context.Context, installerPath string) error
+}
+
+// Versioner to moduł, który zna wersję zainstalowanego klienta.
+type Versioner interface {
+	Version(ctx context.Context) string
+}
+
+// Błędy menedżera sesji.
+var (
+	// ErrNotInstalled: klient pulpitu nie jest zainstalowany na tym komputerze.
+	ErrNotInstalled = errors.New("remote: moduł pulpitu nie jest zainstalowany")
+	// ErrBusy: trwa inna sesja pulpitu.
+	ErrBusy = errors.New("remote: trwa inna sesja pulpitu")
+	// ErrNoSession: brak sesji o podanym identyfikatorze.
+	ErrNoSession = errors.New("remote: brak takiej sesji")
+	// ErrNoInstaller: ten moduł nie umie instalować klienta.
+	ErrNoInstaller = errors.New("remote: moduł nie obsługuje instalacji")
+)
+
+// Stany sesji zgłaszane serwerowi (wire.RemoteState.State).
+const (
+	StateConnected    = "connected"    // inżynier się połączył
+	StateDisconnected = "disconnected" // inżynier się rozłączył, dostęp zamknięty
+	StateExpired      = "expired"      // nikt się nie połączył w czasie życia hasła, dostęp zamknięty
+	StateClosed       = "closed"       // sesja zamknięta poleceniem remote.close, dostęp zamknięty
+)
+
+// Session to jedna sesja zdalna od remote.open do zamknięcia dostępu.
 type Session struct {
-	ID                 string
-	TechnicianRemoteID string
-	OTP                string
-	ExpiresAt          time.Time
-	ConnectedAt        time.Time
-	EndedAt            time.Time
+	ID          string
+	RemoteID    string
+	OTP         string
+	ExpiresAt   time.Time
+	ConnectedAt time.Time
 }
 
 // otpAlphabet pomija znaki łatwe do pomylenia (0/O, 1/l/I).

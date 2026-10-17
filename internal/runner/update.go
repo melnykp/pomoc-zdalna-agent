@@ -14,6 +14,7 @@ import (
 
 	"github.com/melnykp/pomoc-zdalna-agent/internal/transport"
 	"github.com/melnykp/pomoc-zdalna-agent/internal/update"
+	"github.com/melnykp/pomoc-zdalna-agent/pkg/releasesig"
 	"github.com/melnykp/pomoc-zdalna-agent/pkg/wire"
 )
 
@@ -104,6 +105,10 @@ func (r *Runner) requestRelease(ctx context.Context) error {
 // handleOffer przetwarza ofertę wydania: weryfikuje podpis i zgodność, pobiera plik, sprawdza go i przekazuje
 // watchdogowi. Samą podmianę i rollback robi watchdog, bo działający agent nie może zastąpić własnego pliku.
 func (r *Runner) handleOffer(ctx context.Context, offer wire.ReleaseAvailable) {
+	if offer.Component == releasesig.ComponentRemoteModule {
+		r.handleModuleOffer(ctx, offer)
+		return
+	}
 	u := r.o.Update
 	if u == nil {
 		return
@@ -183,4 +188,82 @@ func (r *Runner) handleOffer(ctx context.Context, offer wire.ReleaseAvailable) {
 	}
 	status(wire.UpdateApplying, "")
 	r.log.Info("aktualizacja przekazana watchdogowi", "to", m.Version)
+}
+
+// handleModuleOffer przetwarza ofertę klienta pulpitu (komponent remote_module). Weryfikacja jest ta sama co przy
+// aktualizacji agenta (podpis sshsig manifestu kluczami z pliku, suma SHA-256, Authenticode ze zgodnym podmiotem), a zamiast
+// podmiany własnego pliku agent instaluje klienta cichym instalatorem producenta. Próg bezpieczeństwa agenta nie dotyczy modułu.
+func (r *Runner) handleModuleOffer(ctx context.Context, offer wire.ReleaseAvailable) {
+	u := r.o.Update
+	if u == nil || r.o.Remote == nil {
+		return
+	}
+	if !r.modMu.TryLock() {
+		return // instalacja już trwa
+	}
+	defer r.modMu.Unlock()
+	if u.Paths.IsBad(offer.ReleaseID) {
+		r.log.Debug("wydanie modułu pulpitu odrzucone wcześniej na tym komputerze, pomijam", "release_id", offer.ReleaseID)
+		return
+	}
+
+	current := r.o.Remote.Version(ctx)
+	status := func(state, msg string) {
+		if err := r.sendTyped(ctx, wire.TypeUpdateStatus, wire.UpdateStatus{ReleaseID: offer.ReleaseID, State: state, FromVersion: current, ToVersion: offer.Version, Error: msg}); err != nil {
+			r.log.Debug("status instalacji modułu pulpitu niewysłany", "state", state, "err", err)
+		}
+	}
+	fail := func(stage string, err error) {
+		r.log.Error("instalacja modułu pulpitu odrzucona", "stage", stage, "version", offer.Version, "err", err)
+		status(wire.UpdateFailed, fmt.Sprintf("%s: %v", stage, err))
+	}
+
+	planner := update.Planner{Component: releasesig.ComponentRemoteModule, Signers: u.Signers, CurrentVersion: current, ServerURL: r.Config().ServerURL, OS: runtime.GOOS, Arch: runtime.GOARCH}
+	m, err := planner.Plan(offer)
+	if errors.Is(err, update.ErrUpToDate) {
+		return
+	}
+	if err != nil {
+		fail("weryfikacja oferty", err)
+		return
+	}
+
+	r.log.Info("pobieram moduł pulpitu", "from", current, "to", m.Version)
+	status(wire.UpdateDownloading, "")
+	client := u.HTTP
+	if client == nil {
+		client = transport.NewHTTPClient(0)
+	}
+	dest := filepath.Join(u.Paths.Staging(), fmt.Sprintf("remote-%s.exe", m.Version))
+	dctx, cancel := context.WithTimeout(ctx, 20*time.Minute)
+	err = update.Download(dctx, client, m, dest)
+	cancel()
+	if err != nil {
+		fail("pobieranie", err)
+		return
+	}
+	defer os.Remove(dest)
+
+	verify := u.Verify
+	if verify == nil {
+		verify = update.CheckSignature
+	}
+	if err := verify(dest, m.AuthenticodeSubject); err != nil {
+		fail("podpis pliku", err)
+		return
+	}
+	status(wire.UpdateVerified, "")
+
+	status(wire.UpdateApplying, "")
+	if err := r.o.Remote.Install(ctx, dest); err != nil {
+		// Nieudana instalacja nie jest ponawiana w pętli: wydanie trafia na lokalną listę odrzuconych.
+		_ = u.Paths.MarkBad(offer.ReleaseID)
+		fail("instalacja", err)
+		return
+	}
+	if err := r.o.Remote.Prepare(ctx); err != nil {
+		r.log.Warn("konfiguracja modułu pulpitu po instalacji nieudana", "err", err)
+	}
+	status(wire.UpdateSuccess, "")
+	r.log.Info("moduł pulpitu zainstalowany", "version", m.Version)
 }

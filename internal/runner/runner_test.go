@@ -172,7 +172,7 @@ func TestUnknownCommandReturnsFailureResult(t *testing.T) {
 	start(t, e)
 	waitFor(t, "kanał", func() bool { return e.srv.Connected(deviceID) })
 
-	if err := e.srv.Send(deviceID, cmd(t, "c-2", wire.CmdRemoteOpen, map[string]any{})); err != nil {
+	if err := e.srv.Send(deviceID, cmd(t, "c-2", "polecenie.ktorego.nie.ma", map[string]any{})); err != nil {
 		t.Fatal(err)
 	}
 	var res wire.CmdResult

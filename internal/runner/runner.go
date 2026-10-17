@@ -19,6 +19,7 @@ import (
 	"github.com/melnykp/pomoc-zdalna-agent/internal/heartbeat"
 	"github.com/melnykp/pomoc-zdalna-agent/internal/identity"
 	"github.com/melnykp/pomoc-zdalna-agent/internal/inventory"
+	"github.com/melnykp/pomoc-zdalna-agent/internal/remote"
 	"github.com/melnykp/pomoc-zdalna-agent/internal/session"
 	"github.com/melnykp/pomoc-zdalna-agent/internal/transport"
 	"github.com/melnykp/pomoc-zdalna-agent/internal/trust"
@@ -39,6 +40,9 @@ type Options struct {
 	Backoff   transport.Backoff
 	// Update włącza aktualizacje; nil = agent ignoruje oferty wydań.
 	Update *UpdateOptions
+
+	// Remote to menedżer sesji pulpitu; nil = polecenia remote.* są odrzucane (moduł pulpitu wyłączony w tej wersji).
+	Remote *remote.Manager
 
 	// OnRestart i OnRetire wywołuje runner po odesłaniu wyniku polecenia. Domyślnie nic nie robią.
 	OnRestart func()
@@ -69,6 +73,7 @@ type Runner struct {
 
 	// pending trzyma wyniki do czasu cmd.result.ack; po ponownym połączeniu odsyłamy je jeszcze raz.
 	updMu     sync.Mutex
+	modMu     sync.Mutex // instalacja klienta pulpitu (osobno od aktualizacji agenta)
 	pendingMu sync.Mutex
 	pending   map[string]wire.Envelope
 }
@@ -128,6 +133,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	cfg := r.Config()
 	r.log.Info("agent start", "version", r.o.Versions.Agent, "server", cfg.ServerURL, "device_id", cfg.DeviceID, "ring", cfg.Ring)
 	r.markStarted()
+	r.startRemote(ctx)
 	attempt := 0
 	for ctx.Err() == nil {
 		wait := r.connectOnce(ctx, &attempt)
@@ -137,6 +143,37 @@ func (r *Runner) Run(ctx context.Context) error {
 	}
 	r.log.Info("agent stop")
 	return nil
+}
+
+// startRemote zamyka dostęp pulpitu przy starcie (po awarii w trakcie sesji nie zostaje ważne hasło) i uruchamia obserwację sesji.
+func (r *Runner) startRemote(ctx context.Context) {
+	if r.o.Remote == nil {
+		return
+	}
+	go func() {
+		if err := r.o.Remote.Prepare(ctx); err != nil {
+			r.log.Warn("przygotowanie modułu pulpitu nieudane", "err", err)
+		}
+		r.o.Remote.Run(ctx)
+	}()
+}
+
+// SendRemoteState zgłasza serwerowi zmianę stanu sesji pulpitu (remote.state). Przy braku połączenia ponawia kilka razy:
+// serwer i tak wygasza sesje po czasie, więc zgubiony stan nie zostawia sesji otwartej w panelu na zawsze.
+func (r *Runner) SendRemoteState(sessionID, state string) {
+	go func() {
+		msg := wire.RemoteState{SessionID: sessionID, State: state, At: time.Now().UnixMilli()}
+		for attempt := 0; attempt < 5; attempt++ {
+			ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+			err := r.sendTyped(ctx, wire.TypeRemoteState, msg)
+			cancel()
+			if err == nil {
+				return
+			}
+			time.Sleep(3 * time.Second)
+		}
+		r.log.Warn("nie udało się zgłosić stanu sesji pulpitu", "session_id", sessionID, "state", state)
+	}()
 }
 
 func sleep(ctx context.Context, d time.Duration) error {
@@ -366,6 +403,11 @@ func (r *Runner) sendHeartbeat(ctx context.Context) error {
 // (watchdog po aktualizacji agenta może być starszy, więc nie zakładamy, że jest taka sama).
 func (r *Runner) versions() wire.Versions {
 	v := r.o.Versions
+	if r.o.Remote != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		v.Remote = r.o.Remote.Version(ctx)
+		cancel()
+	}
 	if r.o.Update != nil {
 		if w, err := r.o.Update.Paths.ReadWatchdog(); err == nil {
 			v.Watchdog = w.Version
@@ -472,6 +514,46 @@ func (r *Runner) resendPending(ctx context.Context) {
 }
 
 func (r *Runner) registerCommands() {
+	r.disp.Register(wire.CmdRemoteOpen, func(ctx context.Context, cmd wire.Cmd) (json.RawMessage, error) {
+		if r.o.Remote == nil {
+			return nil, errors.New("moduł pulpitu jest wyłączony w tej wersji agenta")
+		}
+		var p wire.RemoteOpenPayload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil || p.SessionID == "" {
+			return nil, fmt.Errorf("zły ładunek remote.open: %v", err)
+		}
+		sess, err := r.o.Remote.Open(ctx, p.SessionID, time.Duration(p.TTLS)*time.Second)
+		switch {
+		case errors.Is(err, remote.ErrNotInstalled):
+			return nil, errors.New("na tym komputerze nie ma jeszcze modułu pulpitu (RustDesk)")
+		case errors.Is(err, remote.ErrBusy):
+			return nil, errors.New("na tym komputerze trwa już inna sesja pulpitu")
+		case err != nil:
+			return nil, err
+		}
+		// Hasło jednorazowe idzie osobną wiadomością, nigdy w wyniku polecenia (wynik trafia do bazy serwera).
+		otp := wire.RemoteOTP{SessionID: sess.ID, RemoteID: sess.RemoteID, OTP: sess.OTP, ExpiresAt: sess.ExpiresAt.UnixMilli()}
+		if err := r.sendTyped(ctx, wire.TypeRemoteOTP, otp); err != nil {
+			_ = r.o.Remote.Close(ctx, sess.ID)
+			return nil, fmt.Errorf("nie udało się przekazać hasła sesji serwerowi: %w", err)
+		}
+		return json.RawMessage(`{"opened":true}`), nil
+	})
+
+	r.disp.Register(wire.CmdRemoteClose, func(ctx context.Context, cmd wire.Cmd) (json.RawMessage, error) {
+		if r.o.Remote == nil {
+			return nil, errors.New("moduł pulpitu jest wyłączony w tej wersji agenta")
+		}
+		var p wire.RemoteClosePayload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil {
+			return nil, fmt.Errorf("zły ładunek remote.close: %v", err)
+		}
+		if err := r.o.Remote.Close(ctx, p.SessionID); err != nil && !errors.Is(err, remote.ErrNoSession) {
+			return nil, err
+		}
+		return json.RawMessage(`{"closed":true}`), nil
+	})
+
 	r.disp.Register(wire.CmdInventoryRefresh, func(ctx context.Context, _ wire.Cmd) (json.RawMessage, error) {
 		if err := r.sendInventory(ctx); err != nil {
 			return nil, err

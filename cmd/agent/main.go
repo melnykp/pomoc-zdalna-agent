@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync/atomic"
 	"time"
 
 	"github.com/melnykp/pomoc-zdalna-agent/internal/config"
@@ -28,6 +29,7 @@ import (
 	"github.com/melnykp/pomoc-zdalna-agent/internal/identity"
 	"github.com/melnykp/pomoc-zdalna-agent/internal/installer"
 	"github.com/melnykp/pomoc-zdalna-agent/internal/logging"
+	"github.com/melnykp/pomoc-zdalna-agent/internal/remote"
 	"github.com/melnykp/pomoc-zdalna-agent/internal/runner"
 	"github.com/melnykp/pomoc-zdalna-agent/internal/svc"
 	"github.com/melnykp/pomoc-zdalna-agent/internal/update"
@@ -35,11 +37,14 @@ import (
 	"github.com/melnykp/pomoc-zdalna-agent/pkg/wire"
 )
 
-// version i defaultServer są wstrzykiwane przy budowaniu:
-// -ldflags "-X main.version=1.2.3 -X main.defaultServer=https://agent.example.pl".
+// version, defaultServer, remoteHost i remoteKey są wstrzykiwane przy budowaniu:
+// -ldflags "-X main.version=1.2.3 -X main.defaultServer=https://agent.example.pl -X main.remoteHost=relay.example.pl -X main.remoteKey=KLUCZ".
+// Bez remoteHost i remoteKey moduł pulpitu jest wyłączony (polecenia remote.* są odrzucane).
 var (
 	version       = "0.0.0-dev"
 	defaultServer = ""
+	remoteHost    = ""
+	remoteKey     = ""
 )
 
 const messageTitle = config.ProductName
@@ -79,6 +84,19 @@ func main() {
 	switch args[0] {
 	case "version":
 		fmt.Printf("agent %s %s/%s\n", version, runtime.GOOS, runtime.GOARCH)
+	case "remote-selftest":
+		// Samotest modułu pulpitu na komputerze testowym (jako administrator): instalacja, konfiguracja, sesja z hasłem.
+		err = remoteSelfTest(args[1:])
+	case "signer-subject":
+		// Narzędzie dla ceremonii wydania: podmiot certyfikatu pliku tak, jak widzi go agent (do pola manifestu).
+		if len(args) != 2 {
+			err = errors.New("użycie: agent signer-subject <plik.exe>")
+			break
+		}
+		var subject string
+		if subject, err = update.SignerSubjectOf(args[1]); err == nil {
+			fmt.Println(subject)
+		}
 	case "run":
 		err = serve(false)
 	case "watchdog":
@@ -134,7 +152,22 @@ func serve(asService bool) error {
 	if err != nil {
 		return fmt.Errorf("zły wkompilowany klucz podpisu wydań: %w", err)
 	}
+	// Moduł pulpitu (RustDesk) tylko w Windows i tylko z wkompilowanym adresem i kluczem naszego serwera.
+	var rr atomic.Pointer[runner.Runner]
+	var remoteMgr *remote.Manager
+	if runtime.GOOS == "windows" && remoteHost != "" && remoteKey != "" {
+		remoteMgr = remote.NewManager(remote.Options{
+			Module: remote.NewRustDesk(remote.DefaultExe(), remoteHost, remoteKey),
+			Log:    log,
+			Emit: func(sessionID, state string) {
+				if run := rr.Load(); run != nil {
+					run.SendRemoteState(sessionID, state)
+				}
+			},
+		})
+	}
 	r := runner.New(runner.Options{
+		Remote:   remoteMgr,
 		Update:   &runner.UpdateOptions{Paths: update.Paths{Root: config.DataDir()}, Signers: signers},
 		Cfg:      cfg,
 		CfgPath:  cfgPath,
@@ -155,6 +188,7 @@ func serve(asService bool) error {
 			}
 		},
 	})
+	rr.Store(r)
 	if asService {
 		return svc.RunService(svc.ServiceName, r)
 	}

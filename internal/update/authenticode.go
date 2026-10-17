@@ -21,6 +21,10 @@ var RequireAuthenticode = "true"
 // drugi podpis (Authenticode) niczego by nie wnosił.
 var AuthenticodeSubjectPin = ""
 
+// SignerSubjectOf sprawdza podpis Authenticode pliku i zwraca podmiot certyfikatu w postaci, w jakiej agent porównuje go
+// z manifestem. Do ceremonii wydania: wartość trafia do pola authenticode_subject (agent signer-subject <plik>).
+func SignerSubjectOf(path string) (string, error) { return verifyAuthenticode(path) }
+
 // AuthenticodeRequired mówi, czy plik wydania musi mieć ważny podpis Authenticode.
 func AuthenticodeRequired() bool { return RequireAuthenticode != "false" }
 

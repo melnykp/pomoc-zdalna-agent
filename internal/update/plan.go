@@ -23,11 +23,13 @@ var ErrBelowFloor = errors.New("update: wersja poniżej progu bezpieczeństwa")
 // podpisane wydanie z luką (przejęty serwer, konto z rolą inżyniera), cofnąłby komputer do wersji podatnej.
 var ErrDowngrade = errors.New("update: oferta niższa niż uruchomiona wersja (cofanie zabronione)")
 
-// ErrUnsupportedComponent: ta wersja agenta aktualizuje tylko własny plik (komponent agent).
+// ErrUnsupportedComponent: ta wersja agenta obsługuje tylko komponenty agent i remote_module.
 var ErrUnsupportedComponent = errors.New("update: nieobsługiwany komponent")
 
 // Planner sprawdza ofertę wydania zanim cokolwiek zostanie pobrane.
 type Planner struct {
+	// Component to komponent, którego dotyczy oferta (pusty = agent): agent albo remote_module.
+	Component string
 	// Signers to zaufane klucze podpisu wydań (wkompilowane; releasesig.TrustedSigners).
 	Signers        []ssh.PublicKey
 	CurrentVersion string
@@ -42,8 +44,15 @@ type Planner struct {
 // Zwraca manifest tylko wtedy, gdy wszystkie sprawdzenia przeszły. Manifest jest parsowany z tych samych
 // bajtów, które podpisano, a nie z ponownie zakodowanej struktury.
 func (p Planner) Plan(o wire.ReleaseAvailable) (releasesig.Manifest, error) {
-	if o.Component != releasesig.ComponentAgent {
-		return releasesig.Manifest{}, fmt.Errorf("%w: %q", ErrUnsupportedComponent, o.Component)
+	want := p.Component
+	if want == "" {
+		want = releasesig.ComponentAgent
+	}
+	if want != releasesig.ComponentAgent && want != releasesig.ComponentRemoteModule {
+		return releasesig.Manifest{}, fmt.Errorf("%w: %q", ErrUnsupportedComponent, want)
+	}
+	if o.Component != want {
+		return releasesig.Manifest{}, fmt.Errorf("%w: oferta dotyczy %q, oczekiwano %q", ErrUnsupportedComponent, o.Component, want)
 	}
 	if _, err := releasesig.VerifySSHSig([]byte(o.Manifest), []byte(o.Signature), p.Signers); err != nil {
 		return releasesig.Manifest{}, err
@@ -52,7 +61,7 @@ func (p Planner) Plan(o wire.ReleaseAvailable) (releasesig.Manifest, error) {
 	if err != nil {
 		return releasesig.Manifest{}, err
 	}
-	if err := m.Matches(releasesig.ComponentAgent, p.OS, p.Arch); err != nil {
+	if err := m.Matches(want, p.OS, p.Arch); err != nil {
 		return releasesig.Manifest{}, err
 	}
 	if m.Version != o.Version {

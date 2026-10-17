@@ -16,6 +16,9 @@ param(
   # Tylko rozwój i pilot bez certyfikatu kodu: pomija sprawdzanie Authenticode pobranych aktualizacji.
   # Podmiot certyfikatu kodu wkompilowany w plik (pin): aktualizacje muszą być podpisane właśnie nim, niezależnie od manifestu.
   [string]$SignerSubject = "",
+  # Adres i klucz publiczny naszego serwera RustDesk (moduł pulpitu). Bez nich agent nie obsługuje poleceń remote.*.
+  [string]$RemoteHost = "",
+  [string]$RemoteKey = "",
   [switch]$AllowUnsigned,
   [string]$OutDir = (Join-Path $PSScriptRoot ".." "bin")
 )
@@ -26,6 +29,7 @@ $env:GOARCH = "amd64"
 $env:CGO_ENABLED = "0"
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 $ldflags = "-s -w -H=windowsgui -X main.version=$Version"
+if ($RemoteHost -and $RemoteKey) { $ldflags += " -X main.remoteHost=$RemoteHost -X main.remoteKey=$RemoteKey" }
 if ($Server) { $ldflags += " -X main.defaultServer=$Server" }
 if ($ServerKeys) { $ldflags += " -X github.com/melnykp/pomoc-zdalna-agent/internal/trust.Compiled=$ServerKeys" }
 # Klucze zawierają spacje, więc wartość musi być w apostrofach (składnia -ldflags).
