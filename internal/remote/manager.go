@@ -106,6 +106,12 @@ func (m *Manager) Prepare(ctx context.Context) error {
 	if !m.mod.Installed() {
 		return nil
 	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.cur != nil {
+		// Trwa sesja: hasło zamykające nadpisałoby hasło jednorazowe i inżynier by się nie połączył.
+		return ErrBusy
+	}
 	if err := m.mod.EnsureConfig(ctx); err != nil {
 		return fmt.Errorf("konfiguracja klienta pulpitu: %w", err)
 	}

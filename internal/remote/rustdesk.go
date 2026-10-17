@@ -49,6 +49,9 @@ type CLI interface {
 type ExecCLI struct {
 	Exe     string
 	Timeout time.Duration
+	// WaitDelay to czas, jaki czekamy na zamknięcie rur wyjścia po zakończeniu (albo ubiciu) procesu. Instalator klienta
+	// zostawia usługę, która dziedziczy te rury, więc bez limitu Run nigdy by nie wrócił. Zero oznacza 5 sekund.
+	WaitDelay time.Duration
 }
 
 // Run uruchamia klienta z podanymi argumentami. Błąd nie zawiera argumentów, bo mogą nieść hasło.
@@ -61,8 +64,16 @@ func (c ExecCLI) Run(ctx context.Context, args ...string) (string, error) {
 	defer cancel()
 	cmd := exec.CommandContext(ctx, c.Exe, args...)
 	hideWindow(cmd)
+	cmd.WaitDelay = c.WaitDelay
+	if cmd.WaitDelay <= 0 {
+		cmd.WaitDelay = 5 * time.Second
+	}
 	out, err := cmd.CombinedOutput()
 	text := strings.TrimSpace(string(out))
+	// Proces zakończył się powodzeniem, ale jego potomek nadal trzyma rury: wynik mamy, więc to nie jest błąd.
+	if errors.Is(err, exec.ErrWaitDelay) {
+		err = nil
+	}
 	if err != nil {
 		return text, fmt.Errorf("uruchomienie klienta pulpitu: %w", err)
 	}

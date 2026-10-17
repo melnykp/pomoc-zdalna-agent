@@ -256,6 +256,22 @@ func TestOpenFailsWhenModuleMissingOrPasswordCannotBeSet(t *testing.T) {
 	}
 }
 
+// Regresja: przygotowanie klienta po instalacji modułu nie może zamknąć dostępu w trakcie trwającej sesji, bo
+// nadpisałoby hasło jednorazowe i inżynier nie mógłby się połączyć.
+func TestPrepareDoesNotOverwriteOneTimePasswordDuringSession(t *testing.T) {
+	m, mod, _, _ := newManager(t)
+	sess, err := m.Open(context.Background(), "a", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Prepare(context.Background()); !errors.Is(err, ErrBusy) {
+		t.Fatalf("Prepare w trakcie sesji powinno oddać ErrBusy: %v", err)
+	}
+	if got := mod.lastPassword(); got != sess.OTP {
+		t.Fatalf("hasło jednorazowe zostało nadpisane: %q zamiast %q", got, sess.OTP)
+	}
+}
+
 func TestPrepareLocksAccessOnStart(t *testing.T) {
 	m, mod, _, _ := newManager(t)
 	if err := m.Prepare(context.Background()); err != nil {
