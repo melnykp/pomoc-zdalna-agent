@@ -18,6 +18,11 @@ var ErrUpToDate = errors.New("update: ta wersja jest już uruchomiona")
 // ErrBelowFloor oznacza ofertę niższą niż próg bezpieczeństwa zapamiętany z wcześniej widzianego manifestu.
 var ErrBelowFloor = errors.New("update: wersja poniżej progu bezpieczeństwa")
 
+// ErrDowngrade oznacza ofertę niższą niż uruchomiona wersja. Agent nigdy nie cofa się do starszego wydania: wycofanie
+// wadliwego wydania to nowe wydanie z wyższym numerem. Inaczej ktokolwiek, kto wskaże urządzeniu starsze, poprawnie
+// podpisane wydanie z luką (przejęty serwer, konto z rolą inżyniera), cofnąłby komputer do wersji podatnej.
+var ErrDowngrade = errors.New("update: oferta niższa niż uruchomiona wersja (cofanie zabronione)")
+
 // ErrUnsupportedComponent: ta wersja agenta aktualizuje tylko własny plik (komponent agent).
 var ErrUnsupportedComponent = errors.New("update: nieobsługiwany komponent")
 
@@ -55,6 +60,9 @@ func (p Planner) Plan(o wire.ReleaseAvailable) (releasesig.Manifest, error) {
 	}
 	if m.Version == p.CurrentVersion {
 		return releasesig.Manifest{}, ErrUpToDate
+	}
+	if c, err := releasesig.CompareVersions(m.Version, p.CurrentVersion); err == nil && c < 0 {
+		return releasesig.Manifest{}, fmt.Errorf("%w: oferta %s, uruchomiona %s", ErrDowngrade, m.Version, p.CurrentVersion)
 	}
 	if p.Floor != "" {
 		c, err := releasesig.CompareVersions(m.Version, p.Floor)

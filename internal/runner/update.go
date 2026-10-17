@@ -43,8 +43,11 @@ func (r *Runner) markStarted() {
 	if u == nil {
 		return
 	}
-	if err := u.Paths.RecordStart(time.Now()); err != nil {
-		r.log.Warn("zapis startu agenta nieudany", "err", err)
+	// Start po zamierzonym restarcie (polecenie agent.restart) nie liczy się do pętli awarii.
+	if !u.Paths.ConsumeIntentionalRestart(time.Now()) {
+		if err := u.Paths.RecordStart(time.Now()); err != nil {
+			r.log.Warn("zapis startu agenta nieudany", "err", err)
+		}
 	}
 	r.writeHealth(update.PhaseStarted)
 }
@@ -171,7 +174,8 @@ func (r *Runner) handleOffer(ctx context.Context, offer wire.ReleaseAvailable) {
 
 	if err := u.Paths.WriteRequest(update.Request{
 		ReleaseID: offer.ReleaseID, Component: m.Component, Version: m.Version, FromVersion: current, Path: dest,
-		SHA256: m.Artifact.SHA256, Size: m.Artifact.Size, AuthenticodeSubject: m.AuthenticodeSubject, RequestedAt: time.Now().UTC(),
+		SHA256: m.Artifact.SHA256, Size: m.Artifact.Size, AuthenticodeSubject: m.AuthenticodeSubject,
+		Manifest: offer.Manifest, Signature: offer.Signature, RequestedAt: time.Now().UTC(),
 	}); err != nil {
 		_ = os.Remove(dest)
 		fail("przekazanie watchdogowi", err)

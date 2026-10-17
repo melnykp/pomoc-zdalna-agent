@@ -62,11 +62,7 @@ func DataDir() string {
 		return dir
 	}
 	if runtime.GOOS == "windows" {
-		base := os.Getenv("ProgramData")
-		if base == "" {
-			base = `C:\ProgramData`
-		}
-		return filepath.Join(base, ProductDirName)
+		return filepath.Join(programDataDir(), ProductDirName)
 	}
 	return filepath.Join("/var/lib", linuxDirName)
 }

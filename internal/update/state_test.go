@@ -96,3 +96,25 @@ func TestHealthRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestIntentionalRestartMarkerIsConsumedOnceAndExpires(t *testing.T) {
+	p := Paths{Root: t.TempDir()}
+	if p.ConsumeIntentionalRestart(time.Now()) {
+		t.Fatal("bez znacznika nie ma zamierzonego restartu")
+	}
+	if err := p.MarkIntentionalRestart(); err != nil {
+		t.Fatal(err)
+	}
+	if !p.ConsumeIntentionalRestart(time.Now()) {
+		t.Fatal("świeży znacznik powinien zostać rozpoznany")
+	}
+	if p.ConsumeIntentionalRestart(time.Now()) {
+		t.Fatal("znacznik można skonsumować tylko raz")
+	}
+	if err := p.MarkIntentionalRestart(); err != nil {
+		t.Fatal(err)
+	}
+	if p.ConsumeIntentionalRestart(time.Now().Add(10 * time.Minute)) {
+		t.Fatal("stary znacznik nie może zwalniać z liczenia awarii")
+	}
+}

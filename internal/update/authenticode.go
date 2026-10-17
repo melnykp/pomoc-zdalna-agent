@@ -15,6 +15,12 @@ import (
 // i wtedy o zaufaniu do pliku decydują podpis sshsig manifestu oraz suma SHA-256, nie podpis producenta.
 var RequireAuthenticode = "true"
 
+// AuthenticodeSubjectPin to podmiot certyfikatu producenta wkompilowany w plik (-ldflags "-X github.com/melnykp/pomoc-zdalna-agent/internal/update.
+// AuthenticodeSubjectPin=CN=..."). Gdy jest ustawiony, każdy aktualizowany plik musi być podpisany tym podmiotem, niezależnie
+// od tego, co napisano w manifeście. Bez pinu podmiot pochodzi tylko z manifestu, więc przy kradzieży klucza podpisu wydań
+// drugi podpis (Authenticode) niczego by nie wnosił.
+var AuthenticodeSubjectPin = ""
+
 // AuthenticodeRequired mówi, czy plik wydania musi mieć ważny podpis Authenticode.
 func AuthenticodeRequired() bool { return RequireAuthenticode != "false" }
 
@@ -30,6 +36,9 @@ func CheckSignature(path, wantSubject string) error {
 	got, err := verifyAuthenticode(path)
 	if err != nil {
 		return err
+	}
+	if AuthenticodeSubjectPin != "" && !SubjectsEqual(got, AuthenticodeSubjectPin) {
+		return fmt.Errorf("update: podmiot certyfikatu %q różni się od wkompilowanego pinu", got)
 	}
 	if !SubjectsEqual(got, wantSubject) {
 		return fmt.Errorf("update: podmiot certyfikatu %q, manifest %q", got, wantSubject)

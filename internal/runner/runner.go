@@ -186,7 +186,7 @@ func (r *Runner) connectOnce(ctx context.Context, attempt *int) time.Duration {
 		DeviceID:   cfg.DeviceID,
 		Private:    r.o.Identity.Private,
 		ServerKeys: keys,
-		Versions:   r.o.Versions,
+		Versions:   r.versions(),
 		Caps:       []string{"inventory", "commands"},
 	})
 	cancel()
@@ -358,7 +358,20 @@ func (r *Runner) tickLoop(ctx context.Context, conn transport.Conn) error {
 }
 
 func (r *Runner) sendHeartbeat(ctx context.Context) error {
+	r.hb.SetVersions(r.versions())
 	return r.sendTyped(ctx, wire.TypeHeartbeat, r.hb.Collect())
+}
+
+// versions zwraca wersje do raportu: wersja agenta z kompilacji i wersja watchdoga z jego znacznika w katalogu stanu
+// (watchdog po aktualizacji agenta może być starszy, więc nie zakładamy, że jest taka sama).
+func (r *Runner) versions() wire.Versions {
+	v := r.o.Versions
+	if r.o.Update != nil {
+		if w, err := r.o.Update.Paths.ReadWatchdog(); err == nil {
+			v.Watchdog = w.Version
+		}
+	}
+	return v
 }
 
 func (r *Runner) sendInventory(ctx context.Context) error {
@@ -479,6 +492,9 @@ func (r *Runner) registerCommands() {
 
 	r.disp.Register(wire.CmdAgentRestart, func(context.Context, wire.Cmd) (json.RawMessage, error) {
 		if r.o.OnRestart != nil {
+			if r.o.Update != nil {
+				_ = r.o.Update.Paths.MarkIntentionalRestart()
+			}
 			// Opóźnienie daje czas na odesłanie wyniku, zanim proces się zakończy.
 			time.AfterFunc(2*time.Second, r.o.OnRestart)
 		}

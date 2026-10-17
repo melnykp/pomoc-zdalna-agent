@@ -193,6 +193,11 @@ func install(args []string) error {
 	}
 
 	if *enrollOnly {
+		// Tryb dla skryptów i testów. Na prawdziwym katalogu danych (bez RMM_DATA_DIR) wymaga administratora, bo inaczej
+		// zwykły użytkownik założyłby w ProgramData własny, niezaufany katalog dla usługi działającej jako SYSTEM.
+		if runtime.GOOS == "windows" && os.Getenv("RMM_DATA_DIR") == "" && !svc.IsAdmin() {
+			return errors.New("--enroll-only na prawdziwym katalogu danych wymaga uprawnień administratora (do prób ustaw RMM_DATA_DIR)")
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
 		res, err := installer.Enroll(ctx, installer.Params{ServerURL: *server, Token: *token, Version: version, Log: slog.Default()})

@@ -269,13 +269,15 @@ func TestFloorBlocksOlderSignedOfferAndNeverDecreases(t *testing.T) {
 	p := Paths{Root: t.TempDir()}
 	f.planner.CurrentVersion = "1.2.0"
 
-	// Brak progu: starsza podpisana wersja jest przyjmowana (to rollback na życzenie operatora).
+	// Cofanie jest zabronione zawsze, także bez progu: starsza, poprawnie podpisana wersja mogłaby mieć lukę.
 	older := f.offer(t, f.signer, func(m *releasesig.Manifest) { m.Version = "1.1.0" })
-	if _, err := f.planner.Plan(older); err != nil {
-		t.Fatalf("bez progu: %v", err)
+	if _, err := f.planner.Plan(older); !errors.Is(err, ErrDowngrade) {
+		t.Fatalf("starsza oferta niż uruchomiona wersja powinna być odrzucona: %v", err)
 	}
 
-	// Wydanie 1.3.0 deklaruje próg 1.2.5. Po jego zobaczeniu niższe wersje są zakazane.
+	// Próg działa dla komputera, który wrócił do starszej wersji (rollback): działa 1.0.0, a po zobaczeniu wydania 1.3.0
+	// z progiem 1.2.5 niższe wersje są zakazane.
+	f.planner.CurrentVersion = "1.0.0"
 	if err := p.RaiseFloor("1.2.5"); err != nil {
 		t.Fatal(err)
 	}

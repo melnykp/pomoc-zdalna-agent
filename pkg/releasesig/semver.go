@@ -38,7 +38,7 @@ func parseSemver(v string) (semver, error) {
 			return semver{}, fmt.Errorf("%w: %q", ErrBadVersion, v)
 		}
 		for _, id := range strings.Split(pre, ".") {
-			if id == "" {
+			if id == "" || !validIdent(id) {
 				return semver{}, fmt.Errorf("%w: %q", ErrBadVersion, v)
 			}
 			s.pre = append(s.pre, id)
@@ -106,4 +106,17 @@ func compareIdent(a, b string) int {
 		return 1
 	}
 	return strings.Compare(a, b)
+}
+
+// validIdent dopuszcza w identyfikatorze przyrostka tylko znaki z semver (litery, cyfry, myślnik). Wersja trafia do nazwy
+// pliku w staging, więc ukośniki, dwukropki i inne znaki specjalne nie mają tam czego szukać.
+func validIdent(id string) bool {
+	for _, c := range id {
+		switch {
+		case c >= '0' && c <= '9', c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c == '-':
+		default:
+			return false
+		}
+	}
+	return true
 }

@@ -45,6 +45,18 @@ func TestAuthenticodeReadsRealSignerSubject(t *testing.T) {
 	if err := CheckSignature(file, "CN=Ktoś Inny, C=PL"); err == nil {
 		t.Fatal("niezgodny podmiot musi być odrzucony")
 	}
+
+	// Pin wkompilowany w plik: zgodny z podmiotem przechodzi, a obcy odrzuca nawet wtedy, gdy manifest się zgadza.
+	oldPin := AuthenticodeSubjectPin
+	t.Cleanup(func() { AuthenticodeSubjectPin = oldPin })
+	AuthenticodeSubjectPin = subject
+	if err := CheckSignature(file, subject); err != nil {
+		t.Fatalf("zgodny pin powinien przejść: %v", err)
+	}
+	AuthenticodeSubjectPin = "CN=Intruz, O=Intruz, C=PL"
+	if err := CheckSignature(file, subject); err == nil {
+		t.Fatal("obcy pin musi odrzucić plik, nawet gdy podmiot zgadza się z manifestem")
+	}
 }
 
 func TestAuthenticodeRejectsUnsignedFile(t *testing.T) {

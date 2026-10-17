@@ -12,6 +12,7 @@ import (
 	"github.com/melnykp/pomoc-zdalna-agent/internal/svc"
 	"github.com/melnykp/pomoc-zdalna-agent/internal/update"
 	"github.com/melnykp/pomoc-zdalna-agent/internal/watchdog"
+	"github.com/melnykp/pomoc-zdalna-agent/pkg/releasesig"
 )
 
 // serveWatchdog uruchamia nadzorcę agenta: jako usługę Windows (asService) albo w bieżącym procesie.
@@ -53,6 +54,13 @@ func serveWatchdog(asService bool, args []string) error {
 		return fmt.Errorf("brak poprawnej konfiguracji %s: %w", config.Path(), err)
 	}
 
+	// Zaufane klucze podpisu wydań z kompilacji. Gdy ich brak lub są błędne, watchdog nie podmieni niczego.
+	signers, err := releasesig.TrustedSigners()
+	if err != nil {
+		log.Error("zły wkompilowany klucz podpisu wydań: aktualizacje zablokowane", "err", err)
+		signers = nil
+	}
+
 	var ctl watchdog.Controller
 	if *process || !svc.IsWindowsServiceCapable() {
 		ctl = &watchdog.ProcessController{Path: *agentPath, Args: []string{"run"}, Out: os.Stderr}
@@ -67,6 +75,8 @@ func serveWatchdog(asService bool, args []string) error {
 		Verify:          update.CheckSignature,
 		ServerReachable: watchdog.Reachable(cfg.ServerURL),
 		Log:             log,
+		Version:         version,
+		Signers:         signers,
 		HealthTimeout:   *healthTimeout,
 		PollInterval:    *poll,
 	})

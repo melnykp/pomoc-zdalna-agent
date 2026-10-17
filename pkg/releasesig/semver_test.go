@@ -47,3 +47,17 @@ func TestCompareVersionsRejectsMalformed(t *testing.T) {
 		}
 	}
 }
+
+func TestVersionRejectsPathAndSpecialCharactersInPrerelease(t *testing.T) {
+	bad := []string{"1.0.0-rc/1", "1.0.0-a:b", "1.0.0-a\b", "1.0.0-a b", "1.0.0-..", "1.0.0-a_b", "1.0.0-ł"}
+	for _, v := range bad {
+		if _, err := CompareVersions(v, "1.0.0"); err == nil {
+			t.Errorf("%q nie powinno być poprawną wersją", v)
+		}
+	}
+	for _, v := range []string{"1.0.0-rc.1", "1.0.0-alpha-2", "1.0.0-0.3.7"} {
+		if _, err := CompareVersions(v, "1.0.0"); err != nil {
+			t.Errorf("%q powinno być poprawną wersją: %v", v, err)
+		}
+	}
+}

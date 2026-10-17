@@ -10,6 +10,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/windows"
 )
 
 // PromptToken pokazuje okno z prośbą o wklejenie kodu zaproszenia. Używane, gdy plik nie niesie zaproszenia ani w nazwie,
@@ -19,11 +21,12 @@ func PromptToken(ctx context.Context) (string, bool) {
 		"[Microsoft.VisualBasic.Interaction]::InputBox('Wklej kod zaproszenia ze strony pobierania (albo cały link zaproszenia).', 'Piotr Melnyk IT - POMOC Zdalna', '')"
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
-	root := os.Getenv("SystemRoot")
-	if root == "" {
-		root = "C:/Windows"
+	// Katalog systemowy z API, nie ze zmiennej środowiskowej, którą może przestawić zwykły użytkownik.
+	sys, err := windows.GetSystemDirectory()
+	if err != nil || sys == "" {
+		sys = "C:/Windows/System32"
 	}
-	ps := filepath.Join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+	ps := filepath.Join(sys, "WindowsPowerShell", "v1.0", "powershell.exe")
 	cmd := exec.CommandContext(ctx, ps, "-NoProfile", "-WindowStyle", "Hidden", "-Command", script)
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	out, err := cmd.Output()

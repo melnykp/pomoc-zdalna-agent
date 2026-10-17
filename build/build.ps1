@@ -14,6 +14,8 @@ param(
   # Zaufane klucze podpisu wydań (authorized_keys, wpisy rozdzielone średnikiem). Bez nich agent odrzuci każdą aktualizację.
   [string]$Signers = "",
   # Tylko rozwój i pilot bez certyfikatu kodu: pomija sprawdzanie Authenticode pobranych aktualizacji.
+  # Podmiot certyfikatu kodu wkompilowany w plik (pin): aktualizacje muszą być podpisane właśnie nim, niezależnie od manifestu.
+  [string]$SignerSubject = "",
   [switch]$AllowUnsigned,
   [string]$OutDir = (Join-Path $PSScriptRoot ".." "bin")
 )
@@ -28,6 +30,7 @@ if ($Server) { $ldflags += " -X main.defaultServer=$Server" }
 if ($ServerKeys) { $ldflags += " -X github.com/melnykp/pomoc-zdalna-agent/internal/trust.Compiled=$ServerKeys" }
 # Klucze zawierają spacje, więc wartość musi być w apostrofach (składnia -ldflags).
 if ($Signers) { $ldflags += " -X 'github.com/melnykp/pomoc-zdalna-agent/pkg/releasesig.CompiledSigners=$Signers'" }
+if ($SignerSubject) { $ldflags += " -X 'github.com/melnykp/pomoc-zdalna-agent/internal/update.AuthenticodeSubjectPin=$SignerSubject'" }
 if ($AllowUnsigned) { $ldflags += " -X github.com/melnykp/pomoc-zdalna-agent/internal/update.RequireAuthenticode=false" }
 
 # Zasoby pliku .exe: ikona z melnyk.pl i właściwości (firma, nazwa produktu, wersja). Plik .syso lądzi obok

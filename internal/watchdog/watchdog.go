@@ -18,6 +18,8 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/crypto/ssh"
+
 	"github.com/melnykp/pomoc-zdalna-agent/internal/update"
 )
 
@@ -41,6 +43,11 @@ type Options struct {
 	Controller Controller
 	Verify     Verifier
 	Log        *slog.Logger
+	// Version to wersja tego watchdoga, zapisywana w znaczniku dla agenta (raport do serwera).
+	Version string
+	// Signers to zaufane klucze podpisu wydań (wkompilowane). Bez nich watchdog odmawia każdej podmiany: prośba w katalogu
+	// stanu sama niczego nie dowodzi, bo ktoś z dostępem do tego katalogu mógłby w niej podać dowolny plik i sumę.
+	Signers []ssh.PublicKey
 
 	// ServerReachable mówi, czy komputer w ogóle dosięga serwera. Gdy nowa wersja nie zdążyła się połączyć, a serwer
 	// jest nieosiągalny dla całego komputera, nie wolno jej obwiniać o brak połączenia.
@@ -57,8 +64,9 @@ type Options struct {
 
 // Watchdog nadzoruje agenta.
 type Watchdog struct {
-	o   Options
-	log *slog.Logger
+	o      Options
+	log    *slog.Logger
+	infoAt time.Time
 }
 
 // New tworzy watchdoga z uzupełnionymi wartościami domyślnymi.
@@ -95,7 +103,8 @@ func (w *Watchdog) badPath() string  { return w.o.AgentPath + ".bad" }
 
 // Run działa do anulowania ctx: wykonuje prośby o podmianę, pilnuje pętli awarii i dbą o to, żeby agent działał.
 func (w *Watchdog) Run(ctx context.Context) error {
-	w.log.Info("watchdog start", "agent", w.o.AgentPath)
+	w.log.Info("watchdog start", "agent", w.o.AgentPath, "version", w.o.Version)
+	w.writeInfo()
 	t := time.NewTicker(w.o.PollInterval)
 	defer t.Stop()
 	for {
@@ -105,8 +114,27 @@ func (w *Watchdog) Run(ctx context.Context) error {
 			w.log.Info("watchdog stop")
 			return nil
 		case <-t.C:
+			if w.o.Now().Sub(w.infoAt) >= infoEvery {
+				w.writeInfo()
+			}
 		}
 	}
+}
+
+// infoEvery to jak często watchdog odświeża swój znacznik (agent czyta go co heartbeat, więc nie musi to być często).
+const infoEvery = 5 * time.Minute
+
+// writeInfo zapisuje wersję i PID watchdoga w katalogu stanu. Błąd zapisu nie przeszkadza w nadzorze.
+func (w *Watchdog) writeInfo() {
+	if w.o.Version == "" {
+		return
+	}
+	now := w.o.Now()
+	if err := w.o.Paths.WriteWatchdog(update.WatchdogInfo{Version: w.o.Version, PID: os.Getpid(), At: now}); err != nil {
+		w.log.Debug("zapis znacznika watchdoga nieudany", "err", err)
+		return
+	}
+	w.infoAt = now
 }
 
 // Tick wykonuje jeden obrót pętli nadzoru. Wydzielony, żeby testy nie czekały na zegar.
@@ -243,11 +271,16 @@ func (w *Watchdog) validate(req update.Request) error {
 	if req.Version == "" || req.FromVersion == "" || req.ReleaseID == "" {
 		return errors.New("prośba bez wersji lub identyfikatora wydania")
 	}
-	if err := update.VerifyFile(req.Path, artifactOf(req)); err != nil {
+	m, err := w.verifiedManifest(req)
+	if err != nil {
+		return err
+	}
+	// Od tej chwili ufamy tylko podpisanemu manifestowi, a nie polom prośby.
+	if err := update.VerifyFile(req.Path, m.Artifact); err != nil {
 		return err
 	}
 	if w.o.Verify != nil {
-		if err := w.o.Verify(req.Path, req.AuthenticodeSubject); err != nil {
+		if err := w.o.Verify(req.Path, m.AuthenticodeSubject); err != nil {
 			return err
 		}
 	}

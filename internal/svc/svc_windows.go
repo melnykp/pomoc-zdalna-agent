@@ -239,8 +239,27 @@ func SecureDir(path string) error {
 	if err != nil {
 		return err
 	}
-	return windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT,
-		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, dacl, nil)
+	// Właścicielem katalogu zostają Administratorzy: właściciel ma domyślnie prawo zmiany uprawnień, a nie chcemy go
+	// zostawiać nikomu spoza zaufanych kont.
+	admins, err := windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid)
+	if err != nil {
+		return err
+	}
+	err = windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT,
+		windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
+		admins, nil, dacl, nil)
+	if err != nil {
+		// Nie każdy token pozwala przypisać właściciela. Katalog założony przez podniesiony proces ma go już dobrego, więc
+		// ustawiamy samo DACL, a na końcu sprawdzamy, że właściciel jest zaufany.
+		if err := windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT,
+			windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, dacl, nil); err != nil {
+			return err
+		}
+	}
+	if ok, err := DirTrusted(path); err != nil || !ok {
+		return fmt.Errorf("katalog %s nie ma zaufanego właściciela (SYSTEM, Administratorzy): %v", path, err)
+	}
+	return nil
 }
 
 // Message pokazuje okno komunikatu. Gdy isError, z ikoną błędu.
@@ -307,4 +326,92 @@ func AttachParentConsole() {
 	if in, err := os.OpenFile("CONIN$", os.O_RDONLY, 0); err == nil {
 		os.Stdin = in
 	}
+}
+
+// trustedOwners to właściciele, którym wolno należeć do katalogu danych: SYSTEM, Administratorzy i TrustedInstaller.
+func trustedOwners() ([]*windows.SID, error) {
+	var out []*windows.SID
+	for _, kind := range []windows.WELL_KNOWN_SID_TYPE{windows.WinLocalSystemSid, windows.WinBuiltinAdministratorsSid} {
+		sid, err := windows.CreateWellKnownSid(kind)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, sid)
+	}
+	ti, err := windows.StringToSid("S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464")
+	if err != nil {
+		return nil, err
+	}
+	return append(out, ti), nil
+}
+
+// DirTrusted mówi, czy katalog jest zwykłym katalogiem (nie dowiązaniem ani junctionem) należącym do SYSTEM,
+// Administratorów albo TrustedInstaller. Katalog w ProgramData, który utworzył zwykły użytkownik, zaufany nie jest:
+// jego właściciel ma zawsze prawo zmiany uprawnień, więc po instalacji mógłby odzyskać dostęp do klucza urządzenia
+// i plików stanu watchdoga (konto SYSTEM).
+func DirTrusted(path string) (bool, error) {
+	name, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return false, err
+	}
+	attrs, err := windows.GetFileAttributes(name)
+	if err != nil {
+		return false, err
+	}
+	if attrs&windows.FILE_ATTRIBUTE_DIRECTORY == 0 || attrs&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		return false, nil
+	}
+	sd, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION)
+	if err != nil {
+		return false, err
+	}
+	owner, _, err := sd.Owner()
+	if err != nil || owner == nil {
+		return false, err
+	}
+	owners, err := trustedOwners()
+	if err != nil {
+		return false, err
+	}
+	for _, o := range owners {
+		if owner.Equals(o) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// PrepareDataDir przygotowuje katalog danych do instalacji. Brak katalogu: tworzy go. Katalog zaufany: zostaje.
+// Katalog, który ktoś utworzył wcześniej (cudzy właściciel, dowiązanie), jest odkładany na bok pod inną nazwą i
+// zakładany od nowa, a gdy się nie da (otwarte uchwyty), instalacja jest przerywana.
+func PrepareDataDir(dir string) error {
+	_, err := os.Lstat(dir)
+	if os.IsNotExist(err) {
+		return os.MkdirAll(dir, 0o700)
+	}
+	if err != nil {
+		return err
+	}
+	if ok, err := DirTrusted(dir); err == nil && ok {
+		return nil
+	}
+	aside := dir + ".niezaufany-" + time.Now().Format("20060102-150405")
+	if err := os.Rename(dir, aside); err != nil {
+		return fmt.Errorf("katalog danych %s utworzył ktoś inny i nie da się go odłożyć: %w", dir, err)
+	}
+	return os.MkdirAll(dir, 0o700)
+}
+
+// OpenLocked otwiera plik do odczytu z wyłącznym prawem do zapisu i usunięcia dla nas (inni mogą tylko czytać). Instalator
+// otwiera tak własny plik na początku, żeby po zgodzie UAC nikt nie podmienił go przed kopiowaniem do Program Files.
+func OpenLocked(path string) (*os.File, error) {
+	name, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return nil, err
+	}
+	h, err := windows.CreateFile(name, windows.GENERIC_READ, windows.FILE_SHARE_READ, nil, windows.OPEN_EXISTING, windows.FILE_ATTRIBUTE_NORMAL, 0)
+	if err != nil {
+		return nil, err
+	}
+	return os.NewFile(uintptr(h), path), nil
 }

@@ -2,8 +2,11 @@ package watchdog
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -16,7 +19,10 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/crypto/ssh"
+
 	"github.com/melnykp/pomoc-zdalna-agent/internal/update"
+	"github.com/melnykp/pomoc-zdalna-agent/pkg/releasesig"
 )
 
 // fakeAgent udaje agenta: „plik wykonywalny” to tekst „version=1.2.0 behavior=ok”, a Start zachowuje się tak,
@@ -90,6 +96,7 @@ type env struct {
 	reach    bool
 	verified []string
 	verifyFn func(path, subject string) error
+	signer   ssh.Signer
 }
 
 func newEnv(t *testing.T) *env {
@@ -106,7 +113,9 @@ func newEnv(t *testing.T) *env {
 		t.Fatal(err)
 	}
 	e.f = &fakeAgent{paths: e.paths, agentPath: e.agent, running: true}
+	e.signer = newSigner(t)
 	e.w = New(Options{
+		Signers:    []ssh.PublicKey{e.signer.PublicKey()},
 		Paths:      e.paths,
 		AgentPath:  e.agent,
 		Controller: e.f,
@@ -136,10 +145,44 @@ func (e *env) stage(t *testing.T, version, behavior string) update.Request {
 		t.Fatal(err)
 	}
 	sum := sha256.Sum256(body)
-	return update.Request{
+	req := update.Request{
 		ReleaseID: "rel-" + version, Component: "agent", Version: version, FromVersion: "1.2.0",
 		Path: path, SHA256: hex.EncodeToString(sum[:]), Size: int64(len(body)), AuthenticodeSubject: "CN=Firma", RequestedAt: time.Now(),
 	}
+	e.sign(t, &req, e.signer)
+	return req
+}
+
+func newSigner(t *testing.T) ssh.Signer {
+	t.Helper()
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer, err := ssh.NewSignerFromKey(priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return signer
+}
+
+// sign dołącza do prośby manifest zgodny z jej polami, podpisany podanym kluczem (tak jak robi to agent z oferty).
+func (e *env) sign(t *testing.T, req *update.Request, signer ssh.Signer) {
+	t.Helper()
+	m := releasesig.Manifest{
+		Schema: 1, Component: req.Component, Version: req.Version, OS: runtime.GOOS, Arch: runtime.GOARCH,
+		Artifact:            releasesig.Artifact{URL: "https://srv.example/v1/releases/artifacts/agent.exe", SHA256: req.SHA256, Size: req.Size},
+		AuthenticodeSubject: req.AuthenticodeSubject, ReleasedAt: "2026-10-17T10:00:00Z",
+	}
+	raw, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sig, err := releasesig.SignSSHSig(raw, signer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Manifest, req.Signature = string(raw), string(sig)
 }
 
 func (e *env) installed(t *testing.T) string {
@@ -411,5 +454,73 @@ func TestInstalledFileIsExecutableAfterSwap(t *testing.T) {
 	st, err := os.Stat(e.agent)
 	if err != nil || st.Mode().Perm()&0o111 == 0 {
 		t.Fatalf("nowa wersja musi być wykonywalna: %v %v", st, err)
+	}
+}
+
+func TestRunWritesWatchdogVersionForTheAgent(t *testing.T) {
+	e := newEnv(t)
+	e.w.o.Version = "1.2.0"
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	_ = e.w.Run(ctx)
+
+	info, err := e.paths.ReadWatchdog()
+	if err != nil {
+		t.Fatalf("watchdog nie zapisał znacznika: %v", err)
+	}
+	if info.Version != "1.2.0" || info.PID != os.Getpid() || info.At.IsZero() {
+		t.Fatalf("zły znacznik watchdoga: %+v", info)
+	}
+}
+
+func TestWatchdogWithoutVersionWritesNothing(t *testing.T) {
+	e := newEnv(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	_ = e.w.Run(ctx)
+	if _, err := e.paths.ReadWatchdog(); !errors.Is(err, update.ErrNone) {
+		t.Fatalf("bez wersji nie powinno być znacznika, jest: %v", err)
+	}
+}
+
+// Prośba w katalogu stanu nie dowodzi niczego sama z siebie: bez manifestu podpisanego zaufanym kluczem watchdog nie
+// podmienia pliku, nawet gdy suma i rozmiar zgadzają się z podstawionym plikiem.
+func TestRequestWithoutValidManifestSignatureIsRefused(t *testing.T) {
+	cases := map[string]func(e *env, req *update.Request){
+		"manifest podpisany obcym kluczem": func(e *env, req *update.Request) { e.sign(t, req, newSigner(t)) },
+		"brak manifestu i podpisu":         func(e *env, req *update.Request) { req.Manifest, req.Signature = "", "" },
+		"inna suma w prośbie niż w manifeście": func(e *env, req *update.Request) {
+			req.SHA256 = strings.Repeat("a", 64)
+		},
+		"inna wersja w prośbie niż w manifeście": func(e *env, req *update.Request) { req.Version = "9.9.9" },
+		"inny podmiot Authenticode w prośbie":    func(e *env, req *update.Request) { req.AuthenticodeSubject = "CN=Intruz" },
+		"zmieniony rozmiar w prośbie":            func(e *env, req *update.Request) { req.Size++ },
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t)
+			req := e.stage(t, "1.3.0", "ok")
+			mutate(e, &req)
+			res := e.w.Apply(context.Background(), req)
+			if res.State != update.StateFailed {
+				t.Fatalf("prośba powinna zostać odrzucona: %+v", res)
+			}
+			if e.installed(t) != "version=1.2.0 behavior=ok" {
+				t.Fatalf("plik agenta nie może się zmienić: %q", e.installed(t))
+			}
+		})
+	}
+}
+
+func TestWatchdogWithoutTrustedSignersRefusesEverySwap(t *testing.T) {
+	e := newEnv(t)
+	e.w.o.Signers = nil
+	req := e.stage(t, "1.3.0", "ok")
+	res := e.w.Apply(context.Background(), req)
+	if res.State != update.StateFailed || !strings.Contains(res.Error, "klucz") {
+		t.Fatalf("bez kluczy podpisu podmiana powinna być odrzucona: %+v", res)
+	}
+	if e.installed(t) != "version=1.2.0 behavior=ok" {
+		t.Fatalf("plik agenta nie może się zmienić: %q", e.installed(t))
 	}
 }

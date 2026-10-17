@@ -32,18 +32,22 @@ func (p Paths) healthFile() string  { return filepath.Join(p.State(), "health.js
 func (p Paths) startsFile() string  { return filepath.Join(p.State(), "starts.log") }
 func (p Paths) badFile() string     { return filepath.Join(p.State(), "bad-releases.json") }
 
-// Request to prośba agenta do watchdoga o podmianę pliku. Watchdog nie ufa jej: sam sprawdza sumę, rozmiar
-// i Authenticode pliku ze staging.
+// Request to prośba agenta do watchdoga o podmianę pliku. Watchdog nie ufa jej: sprawdza podpis sshsig dołączonego
+// manifestu (kluczami wkompilowanymi w plik), zgodność prośby z manifestem, a potem sumę, rozmiar i Authenticode pliku
+// ze staging według manifestu. Dzięki temu ktoś, kto zapisze prośbę w katalogu stanu, nie podstawi własnego pliku.
 type Request struct {
-	ReleaseID           string    `json:"release_id"`
-	Component           string    `json:"component"`
-	Version             string    `json:"version"`
-	FromVersion         string    `json:"from_version"`
-	Path                string    `json:"path"`
-	SHA256              string    `json:"sha256"`
-	Size                int64     `json:"size"`
-	AuthenticodeSubject string    `json:"authenticode_subject"`
-	RequestedAt         time.Time `json:"requested_at"`
+	ReleaseID           string `json:"release_id"`
+	Component           string `json:"component"`
+	Version             string `json:"version"`
+	FromVersion         string `json:"from_version"`
+	Path                string `json:"path"`
+	SHA256              string `json:"sha256"`
+	Size                int64  `json:"size"`
+	AuthenticodeSubject string `json:"authenticode_subject"`
+	// Manifest i Signature to oferta wydania dokładnie tak, jak ją podpisano (tekst manifestu i podpis sshsig).
+	Manifest    string    `json:"manifest"`
+	Signature   string    `json:"signature"`
+	RequestedAt time.Time `json:"requested_at"`
 }
 
 // Stany wyniku aktualizacji (zgodne ze stanami w wire.UpdateStatus).
@@ -327,4 +331,51 @@ func (p Paths) RaiseFloor(v string) error {
 		}
 	}
 	return writeJSON(p.floorFile(), floorRecord{MinVersion: v, At: time.Now().UTC()})
+}
+
+// WatchdogInfo to znacznik nadzorcy: jego wersja i czas ostatniego zapisu. Agent czyta go, żeby zgłaszać serwerowi
+// wersję watchdoga (to ten sam plik, ale po aktualizacji agenta nadzorca może być starszy).
+type WatchdogInfo struct {
+	Version string    `json:"version"`
+	PID     int       `json:"pid"`
+	At      time.Time `json:"at"`
+}
+
+func (p Paths) watchdogFile() string { return filepath.Join(p.State(), "watchdog.json") }
+
+// WriteWatchdog zapisuje znacznik nadzorcy.
+func (p Paths) WriteWatchdog(w WatchdogInfo) error { return writeJSON(p.watchdogFile(), w) }
+
+// ReadWatchdog odczytuje znacznik nadzorcy; ErrNone, gdy go nie ma.
+func (p Paths) ReadWatchdog() (WatchdogInfo, error) {
+	var w WatchdogInfo
+	return w, readOptional(p.watchdogFile(), &w)
+}
+
+func (p Paths) intentionalRestartFile() string {
+	return filepath.Join(p.State(), "intentional-restart")
+}
+
+// MarkIntentionalRestart zapisuje, że zbliżający się restart agenta jest zamierzony (polecenie agent.restart). Zamierzony
+// restart nie liczy się do pętli awarii, więc nikt nie wymusi rollbacku samymi poleceniami restartu.
+func (p Paths) MarkIntentionalRestart() error {
+	if err := os.MkdirAll(p.State(), 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(p.intentionalRestartFile(), []byte(strconv.FormatInt(time.Now().Unix(), 10)+"\n"), 0o600)
+}
+
+// ConsumeIntentionalRestart zwraca true i usuwa znacznik, gdy poprzedni proces zakończył się zamierzonym restartem
+// (znacznik starszy niż 5 minut jest ignorowany).
+func (p Paths) ConsumeIntentionalRestart(now time.Time) bool {
+	raw, err := os.ReadFile(p.intentionalRestartFile())
+	if err != nil {
+		return false
+	}
+	_ = os.Remove(p.intentionalRestartFile())
+	sec, err := strconv.ParseInt(strings.TrimSpace(string(raw)), 10, 64)
+	if err != nil {
+		return false
+	}
+	return now.Sub(time.Unix(sec, 0)) < 5*time.Minute
 }

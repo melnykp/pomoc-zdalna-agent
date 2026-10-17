@@ -21,8 +21,10 @@ C:\ProgramData\Piotr Melnyk IT - POMOC Zdalna\      (dostęp tylko SYSTEM i Admi
   logs\                       agent.log, watchdog.log (JSON, rotacja)
 ```
 
-Katalog danych ma ACL ograniczone do SYSTEM i Administratorów (`internal/svc`). Szyfrowanie klucza urządzenia przez DPAPI
-jest planowane; do tego czasu ochroną jest ACL katalogu.
+Katalog danych ma ACL ograniczone do SYSTEM i Administratorów, a właścicielem są Administratorzy (`internal/svc`). Instalator
+nie ufa katalogowi, który istniał przed instalacją, jeśli należy do kogoś innego lub jest dowiązaniem: odkłada go na bok
+i zakłada nowy. Klucz prywatny urządzenia jest szyfrowany DPAPI w zakresie maszyny (plik z przedrostkiem `PMZ1:`), więc kopia
+pliku nie działa na innym komputerze. Stary plik ze zwykłym tekstem jest przy pierwszym odczycie przepisywany.
 
 ## 2. Moduły
 
@@ -107,16 +109,19 @@ podpisu wydań. Serwer jedynie przekazuje manifest i podpis, więc przejęcie se
 Agent przyjmuje plik tylko, gdy **wszystko** przejdzie:
 
 1. podpis `sshsig` manifestu ważny, klucz na liście zaufanych, przestrzeń nazw `rmm-release`;
-2. komponent, system i architektura zgodne, wersja wyższa od bieżącej (albo świadomy rollback);
+2. komponent, system i architektura zgodne, wersja **wyższa** od uruchomionej. Agent nigdy nie cofa się do starszego wydania:
+   wycofanie wadliwego wydania to nowe wydanie z wyższym numerem;
 3. po pobraniu SHA-256 i rozmiar zgodne z manifestem (sprawdzane w trakcie strumienia, z limitem rozmiaru);
 4. ważny podpis Authenticode ze znacznikiem czasu, a podmiot certyfikatu zgodny z `authenticode_subject`
    i z podmiotem działającego pliku;
 5. wersja nie jest niższa od zapamiętanego **progu bezpieczeństwa** (`min_version`), żeby przejęty serwer nie
    cofnął agenta do poprawnie podpisanej, ale podatnej wersji.
 
-**Podmiana:** agent zapisuje zweryfikowany plik w `staging` i prośbę o podmianę w `state`. Watchdog nie ufa prośbie: sam
-sprawdza, że ścieżka leży w `staging`, rozmiar, SHA-256 i Authenticode, po czym zatrzymuje agenta, zapisuje poprzednią
-wersję jako `.prev` i podmienia plik.
+**Podmiana:** agent zapisuje zweryfikowany plik w `staging` i prośbę o podmianę w `state`, dołączając do niej manifest i podpis
+sshsig dokładnie tak, jak je dostał. Watchdog nie ufa prośbie: sam weryfikuje podpis manifestu kluczami wkompilowanymi w plik
+(bez nich odmawia każdej podmiany), sprawdza zgodność prośby z manifestem, że ścieżka leży w `staging`, a rozmiar, SHA-256
+i Authenticode bierze z manifestu. Ktoś, kto zdoła zapisać prośbę w katalogu stanu, nie podstawi więc własnego pliku bez klucza
+wydań. Dopiero wtedy watchdog zatrzymuje agenta, zapisuje poprzednią wersję jako `.prev` i podmienia plik.
 
 **Zdrowie i rollback:** nowa wersja jest zdrowa, gdy zrobiła handshake z serwerem i wysłała heartbeat. Jeśli w ciągu
 2 minut tego nie zrobi, a serwer jest osiągalny z komputera, watchdog wraca do `.prev` i oznacza wydanie jako odrzucone.
@@ -131,6 +136,7 @@ aktualizacji też kończą się powrotem. Odrzucone wydania są zapamiętywane i
 | Podszycie się pod urządzenie | klucz Ed25519 per urządzenie, jedna sesja na urządzenie |
 | Fałszywa lub cofnięta aktualizacja | podpis manifestu poza serwerem, SHA-256, Authenticode, próg `min_version`, ponowna weryfikacja przez watchdoga, rollback |
 | Złośliwe polecenie z przejętego serwera | lista poleceń stała i niegroźna, brak wykonywania dowolnego kodu |
+| Zwykły użytkownik komputera przygotowuje katalog danych przed instalacją | instalator odkłada na bok katalog z obcym właścicielem lub dowiązaniem i zakłada własny, a watchdog i tak weryfikuje podpisany manifest |
 | Lokalny administrator manipuluje agentem | ACL katalogu danych i akcje odzyskiwania usług; wykrywanie ręcznego zatrzymania jest planowane. Całkowicie nie da się tego uniemożliwić administratorowi |
 | Wyciek danych | agent wysyła tylko dane z [PRIVACY.md](PRIVACY.md), wyłącznie do wkompilowanego serwera |
 
@@ -145,5 +151,6 @@ Zgłaszanie podatności: [SECURITY.md](../SECURITY.md).
 | `<moduł>/internal/trust.Compiled` | zaufane klucze serwera `id=base64` rozdzielone przecinkami |
 | `<moduł>/pkg/releasesig.CompiledSigners` | zaufane klucze podpisu wydań (format `authorized_keys`) |
 | `<moduł>/internal/update.RequireAuthenticode` | `false` tylko w rozwoju i testach |
+| `<moduł>/internal/update.AuthenticodeSubjectPin` | podmiot certyfikatu producenta: aktualizacje muszą być podpisane właśnie nim, niezależnie od manifestu |
 
 `<moduł>` to ścieżka modułu z `go.mod`. Skrypt `build/build.ps1` składa te opcje z parametrów.

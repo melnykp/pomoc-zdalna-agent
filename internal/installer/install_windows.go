@@ -13,6 +13,8 @@ import (
 	"strings"
 	"syscall"
 
+	"golang.org/x/sys/windows"
+
 	"github.com/melnykp/pomoc-zdalna-agent/internal/config"
 	"github.com/melnykp/pomoc-zdalna-agent/internal/svc"
 )
@@ -27,7 +29,11 @@ const (
 
 // ProgramFilesDir to katalog programu: %ProgramFiles%\<Nazwa>.
 func ProgramFilesDir() string {
-	base := os.Getenv("ProgramFiles")
+	// Z systemu (SHGetKnownFolderPath), nie ze zmiennej środowiskowej, którą może przestawić zwykły użytkownik.
+	base, err := windows.KnownFolderPath(windows.FOLDERID_ProgramFiles, windows.KF_FLAG_DEFAULT)
+	if err != nil || base == "" {
+		base = os.Getenv("ProgramFiles")
+	}
 	if base == "" {
 		base = `C:\Program Files`
 	}
@@ -46,7 +52,23 @@ func Install(ctx context.Context, p Params) (Result, error) {
 	if !svc.IsAdmin() {
 		return Result{}, errors.New("instalacja wymaga uprawnień administratora")
 	}
+	// Własny plik otwieramy od razu i trzymamy z blokadą zapisu: po zgodzie UAC nikt nie podmieni go przed kopiowaniem.
+	selfPath, err := os.Executable()
+	if err != nil {
+		return Result{}, err
+	}
+	self, err := svc.OpenLocked(selfPath)
+	if err != nil {
+		return Result{}, fmt.Errorf("otwarcie własnego pliku: %w", err)
+	}
+	defer self.Close()
+
 	dataDir := config.DataDir()
+	// Katalog danych, który ktoś utworzył przed instalacją (zwykły użytkownik może tworzyć podkatalogi w ProgramData),
+	// nie jest zaufany: odkładamy go na bok i zakładamy nowy z właścicielem Administratorzy.
+	if err := svc.PrepareDataDir(dataDir); err != nil {
+		return Result{}, fmt.Errorf("przygotowanie katalogu danych: %w", err)
+	}
 	if err := svc.SecureDir(dataDir); err != nil {
 		return Result{}, fmt.Errorf("zabezpieczenie katalogu danych: %w", err)
 	}
@@ -68,7 +90,7 @@ func Install(ctx context.Context, p Params) (Result, error) {
 	// Agent i nadzorca to ten sam plik w dwóch kopiach: nadzorca zostaje przy wersji, z którą go zainstalowano,
 	// więc wadliwa aktualizacja agenta nie psuje mechanizmu rollbacku.
 	for _, target := range []string{agentExe, watchdogExe} {
-		if err := copySelf(target); err != nil {
+		if err := copySelf(self, selfPath, target); err != nil {
 			return res, fmt.Errorf("kopiowanie programu: %w", err)
 		}
 	}
@@ -87,22 +109,17 @@ func Install(ctx context.Context, p Params) (Result, error) {
 	return res, nil
 }
 
-func copySelf(target string) error {
-	self, err := os.Executable()
-	if err != nil {
-		return err
-	}
-	if same, _ := sameFile(self, target); same {
+// copySelf kopiuje program z uchwytu otwartego na początku instalacji (src), a nie z ponownie otwartej ścieżki.
+func copySelf(src *os.File, selfPath, target string) error {
+	if same, _ := sameFile(selfPath, target); same {
 		return nil
 	}
 	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 		return err
 	}
-	src, err := os.Open(self)
-	if err != nil {
+	if _, err := src.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
-	defer src.Close()
 	tmp := target + ".new"
 	dst, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)
 	if err != nil {
