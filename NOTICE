@@ -1,0 +1,9 @@
+Piotr Melnyk IT - POMOC Zdalna: agent
+Copyright 2026 Piotr Melnyk (https://melnyk.pl)
+
+Kod źródłowy jest udostępniany na licencji Apache License 2.0 (plik LICENSE).
+
+Nazwa „Piotr Melnyk IT - POMOC Zdalna”, nazwa „Piotr Melnyk IT”, logo „PM” oraz plik build/icon.ico są znakami
+firmowymi autora i nie są objęte licencją Apache 2.0. Wolno budować i uruchamiać agenta z tego kodu, ale pliki
+oznaczone tą nazwą i ikoną może wydawać tylko autor. We własnych kompilacjach zmień nazwę produktu (internal/config,
+build/versioninfo.json) i ikonę.

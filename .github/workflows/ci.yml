@@ -1,0 +1,50 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: gofmt
+        if: matrix.os == 'ubuntu-latest'
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; echo 'uruchom gofmt -w'; exit 1; }
+      - name: vet
+        run: go vet ./...
+      - name: test
+        run: go test -count=1 ./...
+      - name: test z wykrywaniem wyścigów
+        if: matrix.os == 'ubuntu-latest'
+        run: go test -race -count=1 ./...
+
+  build-windows:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: build
+        shell: pwsh
+        run: pwsh -File build/build.ps1 -Version 0.0.0-ci
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-windows-amd64-unsigned
+          path: bin/agent-0.0.0-ci-windows-amd64.exe

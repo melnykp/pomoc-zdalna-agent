@@ -1,0 +1,18 @@
+# Wyniki budowania
+/bin/
+*.exe
+*.syso
+# Klucze i certyfikaty nigdy nie trafiają do repozytorium
+*.pfx
+*.p12
+*.pem
+*.key
+*.cer
+# Pliki lokalne
+*.log
+Thumbs.db
+.vscode/
+.idea/
+
+# Znacznik eksportu z monorepo (nie commitować)
+.exported-from-rmm
