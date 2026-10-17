@@ -35,6 +35,9 @@ func TestAuthenticodeReadsRealSignerSubject(t *testing.T) {
 		t.Fatalf("podmiot powinien mieć składnik CN: %q", subject)
 	}
 	t.Logf("%s podpisany przez: %s", file, subject)
+	if strings.Contains(strings.ToLower(subject), "time stamp") {
+		t.Fatalf("podmiot to urząd znacznika czasu, a nie wydawca pliku: %q", subject)
+	}
 
 	old := RequireAuthenticode
 	RequireAuthenticode = "true"

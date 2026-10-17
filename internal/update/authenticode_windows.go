@@ -3,7 +3,6 @@
 package update
 
 import (
-	"bytes"
 	"crypto/x509"
 	"fmt"
 	"unsafe"
@@ -37,54 +36,63 @@ func verifyAuthenticode(path string) (string, error) {
 	return signerSubject(path)
 }
 
-// signerSubject czyta certyfikat podpisującego z osadzonego podpisu pliku. W magazynie komunikatu PKCS#7 leży
-// certyfikat podpisującego i jego łańcuch, a podpisującym jest ten, który niczego nie wystawił pozostałym.
+var (
+	modCrypt32                      = windows.NewLazySystemDLL("crypt32.dll")
+	procCryptMsgGetParam            = modCrypt32.NewProc("CryptMsgGetParam")
+	procCryptMsgClose               = modCrypt32.NewProc("CryptMsgClose")
+	procCertGetSubjectCertFromStore = modCrypt32.NewProc("CertGetSubjectCertificateFromStore")
+)
+
+const (
+	cmsgSignerCertInfoParam = 7       // CMSG_SIGNER_CERT_INFO_PARAM
+	certEncodingX509AndP7   = 0x10001 // X509_ASN_ENCODING | PKCS_7_ASN_ENCODING
+)
+
+// signerSubject czyta podmiot certyfikatu, którym plik podpisano. Podpisującego wskazuje SignerInfo komunikatu PKCS#7
+// (wystawca i numer seryjny), a nie zgadywanie z magazynu: obok certyfikatu podpisującego leży w nim łańcuch oraz
+// certyfikat urzędu znacznika czasu, który też niczego nie wystawia i dałby fałszywy wynik. Każdy błąd odrzuca plik.
 func signerSubject(path string) (string, error) {
 	p16, err := windows.UTF16PtrFromString(path)
 	if err != nil {
 		return "", err
 	}
-	var store windows.Handle
+	var store, msg windows.Handle
 	err = windows.CryptQueryObject(
 		windows.CERT_QUERY_OBJECT_FILE,
 		unsafe.Pointer(p16),
 		windows.CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED,
 		windows.CERT_QUERY_FORMAT_FLAG_BINARY,
-		0, nil, nil, nil, &store, nil, nil,
+		0, nil, nil, nil, &store, &msg, nil,
 	)
 	if err != nil {
 		return "", fmt.Errorf("%w: odczyt podpisu: %v", ErrNoAuthenticode, err)
 	}
 	defer windows.CertCloseStore(store, 0)
+	defer procCryptMsgClose.Call(uintptr(msg))
 
-	var certs []*x509.Certificate
-	var prev *windows.CertContext
-	for {
-		c, err := windows.CertEnumCertificatesInStore(store, prev)
-		if err != nil || c == nil {
-			break
-		}
-		prev = c
-		if c.EncodedCert == nil || c.Length == 0 {
-			continue
-		}
-		// Kopia bajtów: pamięć kontekstu należy do magazynu i jest zwalniana przy jego zamknięciu.
-		der := append([]byte(nil), unsafe.Slice(c.EncodedCert, c.Length)...)
-		if cert, err := x509.ParseCertificate(der); err == nil {
-			certs = append(certs, cert)
-		}
+	// Pierwsze wywołanie podaje rozmiar, drugie wypełnia CERT_INFO (wskaźniki w nim wskazują do tego samego bufora).
+	var size uint32
+	if r, _, e := procCryptMsgGetParam.Call(uintptr(msg), cmsgSignerCertInfoParam, 0, 0, uintptr(unsafe.Pointer(&size))); r == 0 || size == 0 {
+		return "", fmt.Errorf("%w: brak danych podpisującego: %v", ErrNoAuthenticode, e)
 	}
-	for _, c := range certs {
-		isIssuer := false
-		for _, o := range certs {
-			if o != c && bytes.Equal(o.RawIssuer, c.RawSubject) {
-				isIssuer = true
-				break
-			}
-		}
-		if !isIssuer {
-			return c.Subject.String(), nil
-		}
+	buf := make([]byte, size)
+	if r, _, e := procCryptMsgGetParam.Call(uintptr(msg), cmsgSignerCertInfoParam, 0, uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&size))); r == 0 {
+		return "", fmt.Errorf("%w: odczyt danych podpisującego: %v", ErrNoAuthenticode, e)
 	}
-	return "", fmt.Errorf("%w: brak certyfikatu podpisującego", ErrNoAuthenticode)
+	ctx, _, e := procCertGetSubjectCertFromStore.Call(uintptr(store), certEncodingX509AndP7, uintptr(unsafe.Pointer(&buf[0])))
+	if ctx == 0 {
+		return "", fmt.Errorf("%w: certyfikatu podpisującego nie ma w podpisie: %v", ErrNoAuthenticode, e)
+	}
+	cc := *(**windows.CertContext)(unsafe.Pointer(&ctx)) // wskaźnik zwrócony przez API, nie arytmetyka na adresie
+	defer windows.CertFreeCertificateContext(cc)
+	if cc.EncodedCert == nil || cc.Length == 0 {
+		return "", fmt.Errorf("%w: pusty certyfikat podpisującego", ErrNoAuthenticode)
+	}
+	// Kopia bajtów: pamięć kontekstu jest zwalniana razem z kontekstem.
+	der := append([]byte(nil), unsafe.Slice(cc.EncodedCert, cc.Length)...)
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		return "", fmt.Errorf("%w: certyfikat podpisującego: %v", ErrNoAuthenticode, err)
+	}
+	return cert.Subject.String(), nil
 }
