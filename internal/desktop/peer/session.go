@@ -99,6 +99,13 @@ type Session struct {
 	verified int
 	inputOff atomic.Bool
 
+	// Punkty podmiany w testach: certyfikat zdalny, uruchomienie silnika, odstęp prób weryfikacji.
+	remoteCert func() []byte
+	runEngine  func(ctx context.Context) error
+	verifyPoll time.Duration
+	rejectLog  *rateLimiter // odrzucone wejście: 1 wpis na sekundę
+	sendLog    *rateLimiter // błędy SendInput: 1 wpis na sekundę
+
 	bytesOut atomic.Int64
 	bytesIn  atomic.Int64
 	frames   atomic.Int64
@@ -155,6 +162,24 @@ func New(o Options) (*Session, error) {
 		return nil, err
 	}
 	s := &Session{o: o, log: o.Log, pc: pc, track: track, pay: &codecs.H264Payloader{}, seq: rtp.NewRandomSequencer(), pressd: NewPressed()}
+	s.remoteCert = s.pionRemoteCert
+	s.runEngine = func(ctx context.Context) error { return s.o.Engine.Run(ctx, s) }
+	s.verifyPoll = defaultVerifyPoll
+	s.rejectLog = newRateLimiter(verifyRejectLogEach)
+	s.sendLog = newRateLimiter(time.Second)
+	if o.Injector == nil {
+		s.log.Info("sesja tylko do podglądu: wstrzykiwanie wejścia wyłączone")
+	} else {
+		s.log.Info("wstrzykiwanie wejścia włączone")
+	}
+	o.Engine.SetOnPath(func(pi engine.PathInfo) {
+		s.mu.Lock()
+		dc := s.meta
+		s.mu.Unlock()
+		if dc != nil {
+			s.sendJSON(dc, NewPathMsg(pi.Path, pi.Degraded, pi.Reason))
+		}
+	})
 	sender, err := pc.AddTrack(track)
 	if err != nil {
 		_ = pc.Close()
@@ -175,31 +200,42 @@ func New(o Options) (*Session, error) {
 		}
 	}()
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
-		// Kanały wejścia rejestrujemy dopiero po sprawdzeniu, że certyfikat DTLS drugiej strony to ten przypięty do sesji.
-		if !s.verifyRemote() {
-			return
-		}
-		switch dc.Label() {
+		label := dc.Label()
+		// Handlery rejestrujemy ZAWSZE: certyfikat DTLS widza bywa dostępny chwilę po otwarciu kanału, a handler
+		// niezarejestrowany w tej chwili nie wróciłby już nigdy (wideo płynęłoby, a wejście, kursor i monitory nie).
+		// Bramka weryfikacji stoi w chwili użycia.
+		dc.OnOpen(func() { s.log.Info("kanał danych otwarty", "channel", label) })
+		switch label {
 		case chanCtrl, chanMouse:
-			dc.OnMessage(func(m webrtc.DataChannelMessage) { s.onInput(m.Data) })
+			dc.OnMessage(func(m webrtc.DataChannelMessage) { s.onChannelMessage(label, m.Data) })
 		case chanCursor:
 			dc.OnOpen(func() {
-				s.mu.Lock()
-				s.cursor = dc
-				last := s.lastPtr
-				s.mu.Unlock()
-				// Nowy kanał dostaje od razu ostatni znany kształt i położenie.
-				if last.Shape != nil || last.Moved {
-					s.sendPointer(last, true)
-				}
+				s.log.Info("kanał danych otwarty", "channel", label)
+				s.whenVerified(label, func() {
+					s.mu.Lock()
+					s.cursor = dc
+					last := s.lastPtr
+					s.mu.Unlock()
+					// Nowy kanał dostaje od razu ostatni znany kształt i położenie.
+					if last.Shape != nil || last.Moved {
+						s.sendPointer(last, true)
+					}
+				})
 			})
 		case chanMeta:
 			dc.OnOpen(func() {
-				s.mu.Lock()
-				s.meta = dc
-				s.mu.Unlock()
-				cfg := s.o.Engine.Config()
-				s.sendJSON(dc, map[string]any{"t": "displays", "list": s.o.Displays, "monitor": cfg.Monitor, "fps": cfg.FPS})
+				s.log.Info("kanał danych otwarty", "channel", label)
+				s.whenVerified(label, func() {
+					s.mu.Lock()
+					s.meta = dc
+					s.mu.Unlock()
+					cfg := s.o.Engine.Config()
+					s.sendJSON(dc, map[string]any{"t": "displays", "list": s.o.Displays, "monitor": cfg.Monitor, "fps": cfg.FPS})
+					// Widz, który dołączył po starcie silnika, od razu dowiaduje się, na jakiej ścieżce pracujemy.
+					if pi := s.o.Engine.Path(); pi.Path != "" {
+						s.sendJSON(dc, NewPathMsg(pi.Path, pi.Degraded, pi.Reason))
+					}
+				})
 			})
 		}
 	})
@@ -219,24 +255,7 @@ func New(o Options) (*Session, error) {
 		switch st {
 		case webrtc.PeerConnectionStateConnected:
 			// Certyfikat zdalny bywa dostępny chwilę po zmianie stanu; kilka prób, zanim uznamy brak za błąd.
-			go func() {
-				for i := 0; i < 25; i++ {
-					if s.verifyRemote() {
-						s.start()
-						return
-					}
-					s.mu.Lock()
-					decided := s.verified != 0
-					s.mu.Unlock()
-					if decided {
-						return
-					}
-					time.Sleep(200 * time.Millisecond)
-				}
-				s.log.Error("brak certyfikatu DTLS widza po połączeniu, zamykam")
-				s.end(StateFailed)
-				_ = s.pc.Close()
-			}()
+			go s.verifyThenStart()
 		case webrtc.PeerConnectionStateFailed:
 			s.end(StateFailed)
 		case webrtc.PeerConnectionStateClosed, webrtc.PeerConnectionStateDisconnected:
@@ -310,54 +329,13 @@ func (s *Session) start() {
 	s.mu.Unlock()
 	go func() {
 		defer close(done)
-		if err := s.o.Engine.Run(ctx, s); err != nil && ctx.Err() == nil {
+		if err := s.runEngine(ctx); err != nil && ctx.Err() == nil {
 			s.log.Error("silnik zakończony błędem", "err", err)
 		}
 	}()
 	if s.o.OnState != nil {
 		s.o.OnState(StateConnected, s.Stats())
 	}
-}
-
-// verifyRemote porównuje (raz) certyfikat DTLS drugiej strony z odciskiem z oferty (i przypiętym przez serwer).
-// Niezgodność kończy sesję błędem, zanim jakikolwiek kanał wejścia zacznie działać. Zwraca true, gdy wolno kontynuować.
-func (s *Session) verifyRemote() bool {
-	s.mu.Lock()
-	if s.verified != 0 {
-		ok := s.verified > 0
-		s.mu.Unlock()
-		return ok
-	}
-	want := s.remoteFP
-	s.mu.Unlock()
-	var der []byte
-	if sctp := s.pc.SCTP(); sctp != nil && sctp.Transport() != nil {
-		der = sctp.Transport().GetRemoteCertificate()
-	}
-	if len(der) == 0 {
-		// Certyfikat zdalny jest znany po DTLS; bez niego nie ma jeszcze czego sprawdzać (ani przepuszczać).
-		return false
-	}
-	got := CertificateFingerprint(der)
-	s.mu.Lock()
-	if s.verified != 0 { // wyścig dwóch wywołań: decyduje pierwsze
-		ok := s.verified > 0
-		s.mu.Unlock()
-		return ok
-	}
-	ok := want != "" && strings.EqualFold(got, want)
-	if ok {
-		s.verified = 1
-	} else {
-		s.verified = -1
-	}
-	s.mu.Unlock()
-	if !ok {
-		s.log.Error("certyfikat DTLS widza nie zgadza się z odciskiem sesji, zamykam", "want", want, "got", got)
-		s.end(StateFailed)
-		_ = s.pc.Close()
-	}
-	return ok
 }
 
 // end kończy sesję (raz): najpierw odcina wejście i puszcza klawisze oraz przyciski (to ma być natychmiastowe, zanim
@@ -372,6 +350,7 @@ func (s *Session) end(state string) {
 	cancel, done := s.cancel, s.engineDone
 	s.mu.Unlock()
 	s.inputOff.Store(true)
+	s.o.Engine.SetOnPath(nil)
 	if n := s.pressd.ReleaseAll(s.o.Injector); n > 0 {
 		s.log.Info("puszczono klawisze i przyciski po zakończeniu sesji", "count", n)
 	}
@@ -527,9 +506,10 @@ func (s *Session) onInput(raw []byte) {
 		return
 	}
 	if s.o.Injector == nil {
+		s.rejectInput("ctrl", "tylko podgląd: wstrzykiwanie wejścia wyłączone w tej sesji")
 		return
 	}
 	if _, err := Apply(s.o.Injector, s.pressd, m); err != nil {
-		s.log.Debug("wejście odrzucone", "t", m.T, "err", err)
+		s.logInputError(m.T, err)
 	}
 }

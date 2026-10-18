@@ -86,13 +86,21 @@ func TestHelperEndToEndOnThisDesktop(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var pongs, frameMeta atomic.Int64
+	var pongs, frameMeta, pathMsgs atomic.Int64
+	var degradedSeen atomic.Bool
 	meta.OnMessage(func(m webrtc.DataChannelMessage) {
 		var v struct {
-			T string `json:"t"`
+			T        string `json:"t"`
+			Path     string `json:"path"`
+			Degraded bool   `json:"degraded"`
 		}
 		_ = json.Unmarshal(m.Data, &v)
 		switch v.T {
+		case "path":
+			pathMsgs.Add(1)
+			if v.Degraded || v.Path == "" {
+				degradedSeen.Store(true)
+			}
 		case "pong":
 			pongs.Add(1)
 		case "f":
@@ -149,10 +157,15 @@ func TestHelperEndToEndOnThisDesktop(t *testing.T) {
 	waitCond("kanał sterowania otwarty", 5*time.Second, func() bool { return ctrl.ReadyState() == webrtc.DataChannelStateOpen })
 	_ = ctrl.SendText(`{"t":"ping","tc":1}`)
 	waitCond("pong", 5*time.Second, func() bool { return pongs.Load() >= 1 })
-	// Przełączenie na 60 kl./s w trakcie sesji: silnik startuje od nowa, strumień ma płynąć dalej.
+	// Widz dostaje w kanale meta ścieżkę przechwytywania; na zdrowym komputerze to nie jest tryb awaryjny.
+	waitCond("komunikat o ścieżce", 10*time.Second, func() bool { return pathMsgs.Load() >= 1 })
+	if degradedSeen.Load() {
+		t.Fatal("widz dostał tryb awaryjny na zdrowym komputerze")
+	}
+	// Przełączenie na 60 kl./s w trakcie sesji: silnik startuje od nowa, strumień ma płynąć dalej (na nieruchomym ekranie to klatka kluczowa i klatki podtrzymujące, stąd mały próg).
 	before := packets.Load()
 	_ = ctrl.SendText(`{"t":"cfg","fps":60}`)
-	waitCond("strumień po zmianie klatek", 10*time.Second, func() bool { return packets.Load() > before+100 })
+	waitCond("strumień po zmianie klatek", 10*time.Second, func() bool { return packets.Load() > before+10 })
 	// Ruch kursora (bez klikania): położenie wraca kanałem cursor.
 	_ = ctrl.SendText(`{"t":"mm","x":0.5,"y":0.5}`)
 	time.Sleep(300 * time.Millisecond)

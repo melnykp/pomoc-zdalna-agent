@@ -28,18 +28,21 @@ type Sink interface {
 	Pointer(p capture.Pointer)
 }
 
-// errRestart każe pętli zacząć od nowa z bieżącą konfiguracją (zmiana monitora albo klatek).
-var errRestart = errors.New("engine: restart na żądanie")
-
 // Engine prowadzi jedną pętlę przechwytywania naraz. Reconfigure i RequestKeyFrame można wołać z innych wątków.
 type Engine struct {
 	log    *slog.Logger
 	gen    atomic.Int64 // rośnie przy Reconfigure
 	keyReq atomic.Bool
 
-	mu    sync.Mutex
-	cfg   Config
-	stats Stats
+	mu     sync.Mutex
+	cfg    Config
+	stats  Stats
+	path   PathInfo
+	reason string
+	onPath func(PathInfo)
+
+	// td to pulpit wejściowy, do którego dołączony jest wątek silnika (używane tylko na wątku silnika).
+	td capture.ThreadDesktop
 }
 
 // New tworzy silnik z konfiguracją startową.
@@ -80,7 +83,95 @@ func (e *Engine) Stats() Stats {
 func (e *Engine) setInfo(enc, path string, w, h, fps int) {
 	e.mu.Lock()
 	e.stats.Encoder, e.stats.Path, e.stats.Width, e.stats.Height, e.stats.FPS = enc, path, w, h, fps
+	info := PathInfo{Path: path, Degraded: path == PathGDI}
+	if info.Degraded {
+		info.Reason = e.reason
+	}
+	changed := info != e.path
+	e.path = info
+	cb := e.onPath
 	e.mu.Unlock()
+	if changed && cb != nil {
+		cb(info)
+	}
+}
+
+// Path zwraca ścieżkę, na której silnik pracuje teraz (pusta Path, dopóki żadna nie wystartowała).
+func (e *Engine) Path() PathInfo {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.path
+}
+
+// SetOnPath ustawia wywołanie przy każdej zmianie ścieżki (start, zejście na GDI, powrót na szybką); wołane z wątku silnika.
+func (e *Engine) SetOnPath(fn func(PathInfo)) {
+	e.mu.Lock()
+	e.onPath = fn
+	e.mu.Unlock()
+}
+
+func (e *Engine) setReason(s string) {
+	if len(s) > 200 {
+		s = s[:200]
+	}
+	e.mu.Lock()
+	e.reason = s
+	e.mu.Unlock()
+}
+
+// attachDesktop dołącza wątek silnika do pulpitu wejściowego; zwraca jego nazwę do logów.
+func (e *Engine) attachDesktop() (string, error) { return e.td.Attach() }
+
+// transientOpenError mówi, czy błąd otwarcia źródła warto ponowić: odmowa dostępu i „chwilowo niedostępne” znikają same
+// po przełączeniu pulpitu; „nieobsługiwane” i brak urządzenia nie znikną.
+func transientOpenError(err error) bool {
+	var h com.HRESULT
+	if !errors.As(err, &h) {
+		return true // nieznany błąd: ponów, kilka prób nie szkodzi
+	}
+	switch uint32(h) {
+	case 0x80070005, // E_ACCESSDENIED
+		0x887A0022, // DXGI_ERROR_NOT_CURRENTLY_AVAILABLE
+		0x887A0026, // DXGI_ERROR_ACCESS_LOST
+		0x887A0028, // DXGI_ERROR_SESSION_DISCONNECTED
+		0x887A0027: // DXGI_ERROR_WAIT_TIMEOUT
+		return true
+	}
+	return false
+}
+
+// probeDXGI sprawdza (na osobnym, zablokowanym wątku, dołączonym do pulpitu wejściowego), czy duplikację monitora da się
+// teraz otworzyć. Nie koduje i nie zostawia niczego otwartego.
+func (e *Engine) probeDXGI() error {
+	cfg := e.Config()
+	displays, err := capture.ListDisplays()
+	if err != nil {
+		return err
+	}
+	if cfg.Monitor < 0 || cfg.Monitor >= len(displays) {
+		return fmt.Errorf("monitor %d poza zakresem", cfg.Monitor)
+	}
+	var td capture.ThreadDesktop
+	defer td.Close()
+	_, _ = td.Attach()
+	dup, err := capture.OpenDuplicator(displays[cfg.Monitor])
+	if err != nil {
+		return err
+	}
+	dup.Close()
+	return nil
+}
+
+// goProbeThread uruchamia pętlę sondy na własnym wątku systemowym: SetThreadDesktop zmienia pulpit wątku na stałe, więc
+// wątek nie wraca do puli (gorutyna kończy się bez UnlockOSThread, a Go wtedy niszczy wątek).
+func goProbeThread(f func()) {
+	go func() {
+		runtime.LockOSThread()
+		if err := com.InitMTA(); err == nil {
+			defer com.Uninit()
+		}
+		f()
+	}()
 }
 
 func (e *Engine) count(n int, key bool) {
@@ -102,8 +193,9 @@ func (e *Engine) noteError(err error) {
 // Run działa do anulowania ctx. Awaria ścieżki powoduje zejście na kolejną (gpu → cpu → gdi), a po wyczerpaniu
 // ścieżek odczekanie i ponowną próbę od początku (np. po powrocie z ekranu blokady albo zmianie rozdzielczości).
 func (e *Engine) Run(ctx context.Context, sink Sink) error {
+	// Wątek zostaje zablokowany do końca gorutyny (bez UnlockOSThread): SetThreadDesktop zmienia jego pulpit na stałe, więc
+	// Go ma wątek zniszczyć, a nie oddać do puli innym gorutynom. Uchwyt pulpitu żyje do końca procesu pomocnika (jedna sesja).
 	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
 	if err := com.InitMTA(); err != nil {
 		return err
 	}
@@ -112,37 +204,25 @@ func (e *Engine) Run(ctx context.Context, sink Sink) error {
 		return err
 	}
 	defer mf.Shutdown()
-
-	for ctx.Err() == nil {
-		cfg := e.Config()
-		gen := e.gen.Load()
-		paths := []string{cfg.Path}
-		if cfg.Path == PathAuto {
-			paths = []string{PathGPU, PathCPU, PathGDI}
-		}
-		var err error
-		for _, p := range paths {
-			err = e.runPath(ctx, sink, cfg, p, gen)
-			if ctx.Err() != nil || errors.Is(err, errRestart) {
-				break
-			}
-			if err != nil {
-				e.noteError(err)
-				e.log.Warn("ścieżka silnika zawiodła, próbuję następnej", "path", p, "err", err)
-			}
-		}
-		if ctx.Err() != nil {
-			return nil
-		}
-		if errors.Is(err, errRestart) {
-			continue
-		}
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-time.After(2 * time.Second):
-		}
+	if name, err := e.attachDesktop(); err != nil {
+		e.log.Debug("dołączenie do pulpitu wejściowego nieudane", "input_desktop", name, "err", err)
 	}
+
+	l := newPathLoop()
+	l.log = e.log
+	l.config = e.Config
+	l.gen = e.gen.Load
+	l.run = func(ctx context.Context, cfg Config, path string, gen int64) error {
+		err := e.runPath(ctx, sink, cfg, path, gen)
+		if err != nil && !errors.Is(err, errRestart) && ctx.Err() == nil {
+			e.noteError(err)
+		}
+		return err
+	}
+	l.probe = e.probeDXGI
+	l.goProbe = goProbeThread
+	l.reason = e.setReason
+	l.loop(ctx)
 	return nil
 }
 
@@ -187,9 +267,11 @@ func (p *pacer) wait() {
 func (p *pacer) mark() { p.last = time.Now() }
 
 // emitPointer przekazuje ujściu zmiany kursora, jeśli były.
-func emitPointer(dup *capture.Duplicator, sink Sink) {
-	if p, ok := dup.Pointer(); ok {
-		sink.Pointer(p)
+func emitPointer(src capture.Source, sink Sink) {
+	if ps, ok := src.(capture.PointerSource); ok {
+		if p, ok := ps.Pointer(); ok {
+			sink.Pointer(p)
+		}
 	}
 }
 
@@ -201,9 +283,13 @@ func (e *Engine) runCPU(ctx context.Context, sink Sink, cfg Config, disp capture
 		}
 		return capture.OpenDuplicator(disp)
 	}
-	src, err := open()
+	pol := openRetry
+	if gdi {
+		pol.Attempts = 1
+	}
+	src, err := retryOpen(ctx, pol, e.log, "otwarcie źródła obrazu", e.attachDesktop, open, transientOpenError, func() bool { return e.restartWanted(gen) })
 	if err != nil {
-		return fmt.Errorf("otwarcie źródła obrazu: %w", err)
+		return err
 	}
 	defer func() { src.Close() }()
 
@@ -245,9 +331,7 @@ func (e *Engine) runCPU(ctx context.Context, sink Sink, cfg Config, disp capture
 			pc.mark()
 			raw = f.Pix
 		case errors.Is(err, capture.ErrTimeout):
-			if dup, ok := src.(*capture.Duplicator); ok {
-				emitPointer(dup, sink)
-			}
+			emitPointer(src, sink)
 			if haveFrame && time.Since(lastSent) > 500*time.Millisecond {
 				keepalive = true // ekran stoi: powtórz klatkę, żeby nowy widz dostał obraz, a NAT nie zasnął
 			} else if !haveFrame && time.Since(start) > 2*time.Second {
@@ -266,10 +350,13 @@ func (e *Engine) runCPU(ctx context.Context, sink Sink, cfg Config, disp capture
 				if e.restartWanted(gen) {
 					return errRestart
 				}
-				if ns, oerr := open(); oerr == nil {
+				name, _ := e.attachDesktop()
+				ns, oerr := open()
+				if oerr == nil {
 					src = ns
 					break
 				}
+				e.log.Debug("ponowne otwarcie źródła obrazu nieudane", "input_desktop", name, "err", oerr)
 			}
 			haveFrame = false
 			enc.ForceKeyFrame()
@@ -283,9 +370,7 @@ func (e *Engine) runCPU(ctx context.Context, sink Sink, cfg Config, disp capture
 			}
 			mf.BGRAToNV12(nv12, w, h, f.Pix, f.Stride, cfg.Workers)
 			haveFrame = true
-			if dup, ok := src.(*capture.Duplicator); ok {
-				emitPointer(dup, sink)
-			}
+			emitPointer(src, sink)
 		}
 		if e.keyReq.Swap(false) {
 			enc.ForceKeyFrame()
@@ -318,9 +403,9 @@ func (e *Engine) runGPU(ctx context.Context, sink Sink, cfg Config, disp capture
 	defer com.Release(dev)
 	capture.EnableMultithread(dev)
 
-	dup, err := capture.OpenDuplicatorOn(disp, dev, dctx)
+	dup, err := retryOpen(ctx, openRetry, e.log, "duplikacja", e.attachDesktop, func() (*capture.Duplicator, error) { return capture.OpenDuplicatorOn(disp, dev, dctx) }, transientOpenError, func() bool { return e.restartWanted(gen) })
 	if err != nil {
-		return fmt.Errorf("duplikacja: %w", err)
+		return err
 	}
 	defer func() { dup.Close() }()
 	sw, sh := dup.Size()
@@ -403,10 +488,13 @@ func (e *Engine) runGPU(ctx context.Context, sink Sink, cfg Config, disp capture
 				if e.restartWanted(gen) {
 					return errRestart
 				}
-				if nd, oerr := capture.OpenDuplicatorOn(disp, dev, dctx); oerr == nil {
+				name, _ := e.attachDesktop()
+				nd, oerr := capture.OpenDuplicatorOn(disp, dev, dctx)
+				if oerr == nil {
 					dup = nd
 					break
 				}
+				e.log.Debug("ponowne otwarcie duplikacji nieudane", "input_desktop", name, "err", oerr)
 			}
 			lastIdx = -1
 			enc.ForceKeyFrame()
