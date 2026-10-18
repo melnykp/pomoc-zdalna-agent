@@ -93,6 +93,50 @@ func (m *Manager) Signal(ctx context.Context, sessionID string, sig wire.RemoteS
 	return sg.Signal(ctx, sessionID, sig)
 }
 
+// Elevate przekazuje prośbę inżyniera o podniesienie uprawnień pomocnika w bieżącej sesji modułowi (własny silnik). Prośba spoza
+// trwającej sesji jest odrzucana (ErrNoSession). Kontekst gaśnie razem z sesją, więc pytanie o zgodę nie przeżyje jej końca.
+func (m *Manager) Elevate(ctx context.Context, req ElevationRequest) (ElevationOutcome, error) {
+	el, ok := m.mod.(Elevator)
+	if !ok {
+		return outcome(wire.ElevationUnavailable, "ten moduł pulpitu nie obsługuje podniesienia uprawnień"), nil
+	}
+	m.mu.Lock()
+	if m.cur == nil || m.cur.ID != req.SessionID {
+		m.mu.Unlock()
+		return ElevationOutcome{}, ErrNoSession
+	}
+	sessCtx := m.cur.ctx
+	m.mu.Unlock()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stop := context.AfterFunc(sessCtx, cancel)
+	defer stop()
+	return el.Elevate(ctx, req)
+}
+
+// ActivateElevation domyka zgodę po potwierdzeniu serwera (moduł podnosi poziom pomocnika w tej sesji); ErrNoSession, gdy sesja już się skończyła.
+func (m *Manager) ActivateElevation(sessionID string) error {
+	f, ok := m.mod.(ElevationFinisher)
+	if !ok {
+		return ErrNoSession
+	}
+	m.mu.Lock()
+	cur := m.cur
+	m.mu.Unlock()
+	if cur == nil || cur.ID != sessionID {
+		f.CancelElevation(sessionID)
+		return ErrNoSession
+	}
+	return f.ActivateElevation(sessionID)
+}
+
+// CancelElevation anuluje zgodę, która nie doczekała się potwierdzenia serwera.
+func (m *Manager) CancelElevation(sessionID string) {
+	if f, ok := m.mod.(ElevationFinisher); ok {
+		f.CancelElevation(sessionID)
+	}
+}
+
 // Install instaluje klienta pulpitu z pliku instalacyjnego (wcześniej zweryfikowanego przez wywołującego) i unieważnia
 // zapamiętaną wersję. Błąd ErrNoInstaller, gdy moduł nie umie instalować.
 func (m *Manager) Install(ctx context.Context, installerPath string) error {

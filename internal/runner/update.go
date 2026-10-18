@@ -13,6 +13,7 @@ import (
 
 	"golang.org/x/crypto/ssh"
 
+	"github.com/melnykp/pomoc-zdalna-agent/internal/remote"
 	"github.com/melnykp/pomoc-zdalna-agent/internal/transport"
 	"github.com/melnykp/pomoc-zdalna-agent/internal/update"
 	"github.com/melnykp/pomoc-zdalna-agent/pkg/releasesig"
@@ -214,6 +215,13 @@ func (r *Runner) handleOffer(ctx context.Context, offer wire.ReleaseAvailable) {
 type ComponentInstaller interface {
 	Version(ctx context.Context) string
 	InstallVersion(ctx context.Context, path, version string) error
+}
+
+// HelperReporter to komponent, który zna poziom uprawnień pomocnika pulpitu i token z jego ostatniego startu (remote.Engine):
+// Level to poziom, z którym agent wystartował (zmiana w config.json działa dopiero po restarcie), Token i Fallback opisują ostatni
+// start pomocnika (puste przed pierwszym), SessionLevel podniesienie na czas trwającej sesji za zgodą użytkownika, UAC stan kontroli konta.
+type HelperReporter interface {
+	HelperStatus() remote.HelperStatus
 }
 
 // installComponentOffer przetwarza ofertę komponentu pulpitu (remote_module albo desktop_helper). Weryfikacja jest ta sama

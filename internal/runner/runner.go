@@ -47,6 +47,8 @@ type Options struct {
 
 	// Remote to menedżer sesji pulpitu; nil = polecenia remote.* są odrzucane (moduł pulpitu wyłączony w tej wersji).
 	Remote *remote.Manager
+	// ElevationAckWait to czas oczekiwania na potwierdzenie serwera po zgodzie użytkownika (domyślnie 20 s); bez potwierdzenia zgoda jest anulowana.
+	ElevationAckWait time.Duration
 	// Helper instaluje pomocnika własnego silnika (komponent desktop_helper) niezależnie od włączonego silnika, żeby
 	// przełączenie na własny silnik nie czekało na pobranie pliku; nil = oferty desktop_helper są odrzucane.
 	Helper ComponentInstaller
@@ -83,6 +85,10 @@ type Runner struct {
 	modMu     sync.Mutex // instalacja klienta pulpitu (osobno od aktualizacji agenta)
 	pendingMu sync.Mutex
 	pending   map[string]wire.Envelope
+
+	// elevAcks czeka na potwierdzenie serwera (remote.elevation.ack) dla zgody użytkownika na podniesienie uprawnień, po request_id.
+	elevMu   sync.Mutex
+	elevAcks map[string]chan bool
 }
 
 // New tworzy Runner i rejestruje obsługę poleceń.
@@ -217,6 +223,122 @@ func (r *Runner) handleRemoteSignal(ctx context.Context, sig wire.RemoteSignal) 
 		reply(wire.RemoteSignal{SessionID: sig.SessionID, Kind: wire.SignalError, Error: err.Error()})
 	case out != nil:
 		reply(*out)
+	}
+}
+
+// handleRemoteElevate obsługuje prośbę inżyniera o podniesienie uprawnień pomocnika w trwającej sesji: pyta użytkownika na
+// komputerze o zgodę (to trwa do minuty) i odsyła wynik serwerowi, który zapisuje go w audycie i pokazuje inżynierowi.
+// Granice długości danych prośby o podniesienie uprawnień z serwera; dłuższe są odrzucane, zanim cokolwiek z nich trafi do okna zgody.
+const (
+	maxElevIDLen    = 64
+	maxElevNameLen  = 200
+	maxElevLoginLen = 320
+)
+
+// expectElevAck rejestruje oczekiwanie na potwierdzenie serwera dla prośby; wynik (zgoda przyjęta czy nie) trafia do zwróconego kanału.
+func (r *Runner) expectElevAck(requestID string) chan bool {
+	ch := make(chan bool, 1)
+	r.elevMu.Lock()
+	if r.elevAcks == nil {
+		r.elevAcks = map[string]chan bool{}
+	}
+	r.elevAcks[requestID] = ch
+	r.elevMu.Unlock()
+	return ch
+}
+
+func (r *Runner) dropElevAck(requestID string) {
+	r.elevMu.Lock()
+	delete(r.elevAcks, requestID)
+	r.elevMu.Unlock()
+}
+
+// deliverElevAck przekazuje potwierdzenie serwera oczekującej prośbie; potwierdzenie bez oczekującej prośby (spóźnione, cudze) jest ignorowane.
+func (r *Runner) deliverElevAck(ack wire.RemoteElevationAck) {
+	r.elevMu.Lock()
+	ch := r.elevAcks[ack.RequestID]
+	r.elevMu.Unlock()
+	if ch == nil {
+		r.log.Debug("potwierdzenie zgody bez oczekującej prośby pominięte", "request_id", ack.RequestID)
+		return
+	}
+	select {
+	case ch <- ack.Accepted:
+	default:
+	}
+}
+
+func (r *Runner) elevationAckWait() time.Duration {
+	if r.o.ElevationAckWait > 0 {
+		return r.o.ElevationAckWait
+	}
+	return 20 * time.Second
+}
+
+// SendRemoteHelper zgłasza serwerowi start pomocnika w sesji (remote.helper, do audytu: z jakim tokenem naprawdę wystartował). Najwyżej kilka
+// prób w tle; zgubione zgłoszenie nie psuje sesji.
+func (r *Runner) SendRemoteHelper(msg wire.RemoteHelper) {
+	go func() {
+		for attempt := 0; attempt < 5; attempt++ {
+			ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+			err := r.sendTyped(ctx, wire.TypeRemoteHelper, msg)
+			cancel()
+			if err == nil {
+				return
+			}
+			time.Sleep(3 * time.Second)
+		}
+		r.log.Warn("nie udało się zgłosić startu pomocnika w sesji", "session_id", msg.SessionID, "token", msg.Token)
+	}()
+}
+
+func (r *Runner) handleRemoteElevate(ctx context.Context, req wire.RemoteElevate) {
+	reply := func(state, reason string) {
+		out := wire.RemoteElevation{SessionID: req.SessionID, RequestID: req.RequestID, State: state, Reason: reason}
+		if err := r.sendTyped(ctx, wire.TypeRemoteElevation, out); err != nil {
+			r.log.Warn("wynik prośby o podniesienie uprawnień niewysłany", "err", err)
+		}
+	}
+	if len(req.Engineer) > maxElevNameLen || len(req.EngineerLogin) > maxElevLoginLen || len(req.Tenant) > maxElevNameLen {
+		reply(wire.ElevationError, "dane prośby o podniesienie uprawnień są za długie")
+		return
+	}
+	if r.o.Remote == nil {
+		reply(wire.ElevationUnavailable, "moduł pulpitu jest wyłączony w tej wersji agenta")
+		return
+	}
+	ackCh := r.expectElevAck(req.RequestID)
+	defer r.dropElevAck(req.RequestID)
+	out, err := r.o.Remote.Elevate(ctx, remote.ElevationRequest{SessionID: req.SessionID, RequestID: req.RequestID, Engineer: req.Engineer, Login: req.EngineerLogin, Tenant: req.Tenant})
+	switch {
+	case errors.Is(err, remote.ErrNoSession):
+		reply(wire.ElevationError, "brak otwartej sesji pulpitu o tym identyfikatorze")
+	case err != nil:
+		r.log.Warn("prośba o podniesienie uprawnień nieudana", "err", err)
+		reply(wire.ElevationError, err.Error())
+	case out.State != wire.ElevationGranted:
+		reply(out.State, out.Reason)
+	default:
+		// Użytkownik zezwolił, ale poziomu NIE podnosimy, dopóki serwer nie potwierdzi zapisu zgody w audycie: zerwanie połączenia po „Tak”
+		// nie może dać w audycie odmowy przy faktycznie podniesionym pomocniku. Bez potwierdzenia zgoda jest anulowana.
+		reply(out.State, out.Reason)
+		select {
+		case ok := <-ackCh:
+			if !ok {
+				r.log.Warn("serwer nie przyjął zgody (prośba wygasła albo nieznana): poziom pomocnika bez zmian", "request_id", req.RequestID)
+				r.o.Remote.CancelElevation(req.SessionID)
+				return
+			}
+			if err := r.o.Remote.ActivateElevation(req.SessionID); err != nil {
+				r.log.Warn("nie udało się podnieść uprawnień pomocnika po potwierdzeniu serwera", "err", err, "request_id", req.RequestID)
+			}
+		case <-time.After(r.elevationAckWait()):
+			r.log.Warn("brak potwierdzenia serwera dla zgody na podniesienie uprawnień: poziom pomocnika bez zmian", "request_id", req.RequestID)
+			r.o.Remote.CancelElevation(req.SessionID)
+		case <-ctx.Done():
+			r.log.Warn("połączenie z serwerem zerwane przed potwierdzeniem zgody: poziom pomocnika bez zmian", "request_id", req.RequestID)
+			r.o.Remote.CancelElevation(req.SessionID)
+		}
 	}
 }
 
@@ -452,6 +574,18 @@ func (r *Runner) versions() wire.Versions {
 		engine = config.RemoteEngineRustDesk
 	}
 	v.RemoteEngine = engine
+	// Poziom skuteczny (z jakim wystartował silnik) osobno od zapisanego w konfiguracji: po config.set, a przed restartem,
+	// to dwie różne rzeczy, a panel ma je rozróżniać.
+	v.HelperLevelCfg = r.Config().HelperLevel()
+	v.HelperLevel = v.HelperLevelCfg
+	if hr, ok := r.o.Helper.(HelperReporter); ok {
+		st := hr.HelperStatus()
+		if st.Level != "" {
+			v.HelperLevel = st.Level
+		}
+		v.HelperToken, v.HelperFallback = st.Token, st.Fallback
+		v.HelperLevelSession, v.UAC = st.SessionLevel, st.UAC
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	// Przy własnym silniku menedżer opakowuje pomocnika, więc jego wersja nie jest wersją klienta RustDesk.
@@ -532,6 +666,24 @@ func (r *Runner) readLoop(ctx context.Context, conn transport.Conn, wg *sync.Wai
 				defer wg.Done()
 				r.handleRemoteSignal(ctx, sig)
 			}()
+		case wire.TypeRemoteElevate:
+			var req wire.RemoteElevate
+			if err := env.Decode(&req); err != nil || req.SessionID == "" || req.RequestID == "" || len(req.SessionID) > maxElevIDLen || len(req.RequestID) > maxElevIDLen {
+				r.log.Warn("nieprawidłowa prośba o podniesienie uprawnień od serwera", "err", err)
+				continue
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				r.handleRemoteElevate(ctx, req)
+			}()
+		case wire.TypeRemoteElevAck:
+			var ack wire.RemoteElevationAck
+			if err := env.Decode(&ack); err != nil || ack.RequestID == "" {
+				r.log.Warn("nieprawidłowe potwierdzenie zgody od serwera", "err", err)
+				continue
+			}
+			r.deliverElevAck(ack)
 		case wire.TypeError:
 			var e wire.ErrorMsg
 			_ = env.Decode(&e)
@@ -697,6 +849,9 @@ func (r *Runner) applyConfig(p wire.ConfigSetPayload) (json.RawMessage, error) {
 	if p.RemoteEngine != nil {
 		next.RemoteEngine = *p.RemoteEngine
 	}
+	if p.DesktopHelperLevel != nil {
+		next.DesktopHelperLevel = *p.DesktopHelperLevel
+	}
 	if err := next.Validate(); err != nil {
 		r.cfgMu.Unlock()
 		return nil, err
@@ -714,5 +869,5 @@ func (r *Runner) applyConfig(p wire.ConfigSetPayload) (json.RawMessage, error) {
 	case r.cfgChanged <- struct{}{}:
 	default:
 	}
-	return json.Marshal(map[string]any{"heartbeat_s": next.HeartbeatSeconds, "inventory_h": next.InventoryHours, "whitelist": len(next.Whitelist), "remote_engine": next.RemoteEngine})
+	return json.Marshal(map[string]any{"heartbeat_s": next.HeartbeatSeconds, "inventory_h": next.InventoryHours, "whitelist": len(next.Whitelist), "remote_engine": next.RemoteEngine, "desktop_helper_level": next.HelperLevel()})
 }

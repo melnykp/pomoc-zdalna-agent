@@ -19,6 +19,11 @@ const (
 	DesktopSignal DesktopKind = "signal"
 	// DesktopStop kończy sesję: pomocnik puszcza klawisze i przyciski, zamyka połączenie i kończy proces.
 	DesktopStop DesktopKind = "stop"
+	// DesktopPause wstrzymuje wstrzykiwanie wejścia od widza (ramki ctrl i mouse są odrzucane, wciśnięte klawisze puszczone) na czas pytania
+	// użytkownika o zgodę, żeby inżynier nie klikał w nic obok okna zgody; DesktopResume je wznawia. Pomocnik sam wznawia po pauzie
+	// po czasie (zabezpieczenie przed zgubionym DesktopResume).
+	DesktopPause  DesktopKind = "pause"
+	DesktopResume DesktopKind = "resume"
 )
 
 // Komunikaty pomocnik → usługa.
@@ -33,6 +38,15 @@ const (
 	DesktopState DesktopKind = "state"
 	// DesktopLog: linia dziennika pomocnika do zapisania w logu usługi.
 	DesktopLog DesktopKind = "log"
+	// DesktopConsent: decyzja użytkownika z okna zgody na podniesienie uprawnień (State: ConsentAllow | ConsentDeny); wysyła ją podproces
+	// "desktop-helper consent" uruchomiony przez usługę z tokenem o wysokiej integralności.
+	DesktopConsent DesktopKind = "consent"
+)
+
+// Decyzje użytkownika w oknie zgody (DesktopMsg.State przy DesktopConsent).
+const (
+	ConsentAllow = "allow"
+	ConsentDeny  = "deny"
 )
 
 // Stany połączenia zgłaszane przez pomocnika.

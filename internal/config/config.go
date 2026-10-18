@@ -29,6 +29,22 @@ const (
 	RemoteEngineWebRTC   = "webrtc"
 )
 
+// Poziomy uprawnień pomocnika pulpitu (to samo co wire.HelperLevel*). Żaden nie jest kontem SYSTEM.
+const (
+	// DesktopHelperIntegrity: ZWYKŁY (filtrowany) token użytkownika z podniesioną do wysokiej integralnością, bez grupy Administratorzy
+	// i z odjętymi uprawnieniami. UIPI porównuje tylko integralność, więc pomocnik może sterować oknami administratora, a po jego
+	// przejęciu napastnik nie dostaje praw administratora. Włączany świadomie dla komputera bez nadzoru (serwer); na komputerze z
+	// użytkownikiem przy klawiaturze ten poziom pomocnik dostaje tylko na czas sesji, za zgodą użytkownika (prośba w widzu).
+	DesktopHelperIntegrity = "integrity"
+	// DesktopHelperAdmin: pomocnik z podniesionym tokenem TEGO SAMEGO użytkownika (połączony token UAC, grupa Administratorzy włączona).
+	// Tylko jako świadomy wybór, gdy "integrity" nie wystarcza do okien administratora.
+	DesktopHelperAdmin = "admin"
+	// DesktopHelperUser: token średniej integralności (jak w 0.4.2). Domyślny (także pusty): żadna aktualizacja nie podnosi uprawnień
+	// po cichu. Wejście do okien administratora jest blokowane przez UIPI, dopóki użytkownik nie zezwoli na prośbę inżyniera.
+	// Gdy token użytkownika jest podniesiony (UAC wyłączone), pomocnik dostaje jego odchudzoną wersję, nigdy pełny token.
+	DesktopHelperUser = "user"
+)
+
 // Pierścienie wdrożeń.
 const (
 	RingCanary  = "canary"
@@ -48,6 +64,8 @@ type Config struct {
 	// RemoteEngine wybiera silnik pulpitu: "rustdesk" (domyślnie, pusty tekst) albo "webrtc" (własny silnik,
 	// docs/adr/0009). Zmiana działa od następnego startu agenta.
 	RemoteEngine string `json:"remote_engine,omitempty"`
+	// DesktopHelperLevel: "user" (domyślnie, także pusty), "integrity" albo "admin"; zmiana działa od następnego startu agenta.
+	DesktopHelperLevel string `json:"desktop_helper_level,omitempty"`
 	// ServerKeys to klucze publiczne serwera zapisane przy rejestracji. Gdy do agenta wkompilowano klucze
 	// (internal/trust), mają pierwszeństwo, a te służą tylko w buildach rozwojowych.
 	ServerKeys []ServerKey `json:"server_keys,omitempty"`
@@ -146,7 +164,24 @@ func (c Config) Validate() error {
 	default:
 		errs = append(errs, fmt.Errorf("config: nieznany silnik pulpitu %q", c.RemoteEngine))
 	}
+	switch c.DesktopHelperLevel {
+	case "", DesktopHelperIntegrity, DesktopHelperAdmin, DesktopHelperUser:
+	default:
+		errs = append(errs, fmt.Errorf("config: nieznany poziom uprawnień pomocnika %q", c.DesktopHelperLevel))
+	}
 	return errors.Join(errs...)
+}
+
+// HelperLevel zwraca skuteczny poziom uprawnień pomocnika: pusty tekst oznacza domyślny "user" (stare konfiguracje nie
+// dostają podniesionych uprawnień po cichu).
+func (c Config) HelperLevel() string {
+	switch c.DesktopHelperLevel {
+	case DesktopHelperIntegrity:
+		return DesktopHelperIntegrity
+	case DesktopHelperAdmin:
+		return DesktopHelperAdmin
+	}
+	return DesktopHelperUser
 }
 
 func isLocalhost(host string) bool {

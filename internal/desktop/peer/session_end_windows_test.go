@@ -100,3 +100,41 @@ func TestInputIsIgnoredAfterEnd(t *testing.T) {
 		t.Fatal("rejestr wciśniętych ma być pusty")
 	}
 }
+
+// Na czas pytania użytkownika o zgodę wejście od widza jest wstrzymane: wciśnięte klawisze zostają puszczone, kolejne zdarzenia sterujące są
+// odrzucane (inżynier nie kliknie w nic obok okna zgody), a po wznowieniu wejście znowu działa. Ping, puszczenie klawiszy i zmiana
+// monitora nie są wstrzymywane.
+func TestPauseInputDropsControlEventsAndReleasesKeysUntilResumed(t *testing.T) {
+	inj := &timedInjector{}
+	s := bareSession(inj)
+	s.onInput([]byte(`{"t":"kd","c":"ShiftLeft"}`))
+	s.onInput([]byte(`{"t":"md","b":0}`))
+	if inj.pressed != 2 {
+		t.Fatalf("wciśniętych %d", inj.pressed)
+	}
+
+	s.PauseInput(true)
+	inj.mu.Lock()
+	released := len(inj.released)
+	inj.mu.Unlock()
+	if released != 2 || s.pressd.Count() != 0 {
+		t.Fatalf("przy wstrzymaniu klawisze mają zostać puszczone: puszczono %d, wciśniętych %d", released, s.pressd.Count())
+	}
+	for _, ev := range []string{`{"t":"kd","c":"KeyA"}`, `{"t":"md","b":0}`, `{"t":"mm","x":0.5,"y":0.5}`, `{"t":"wh","dy":120}`} {
+		s.onInput([]byte(ev))
+	}
+	if inj.pressed != 2 {
+		t.Fatalf("w czasie pauzy nic nie może zostać wstrzyknięte, a jest %d wciśnięć", inj.pressed)
+	}
+	if s.inputStats.Rejected.Load() < 4 {
+		t.Fatalf("odrzucone zdarzenia mają trafić do statystyk, jest %d", s.inputStats.Rejected.Load())
+	}
+	// Podwójne wstrzymanie i wznowienie są bezpieczne.
+	s.PauseInput(true)
+	s.PauseInput(false)
+	s.PauseInput(false)
+	s.onInput([]byte(`{"t":"kd","c":"KeyA"}`))
+	if inj.pressed != 3 {
+		t.Fatalf("po wznowieniu wejście działa: %d wciśnięć", inj.pressed)
+	}
+}

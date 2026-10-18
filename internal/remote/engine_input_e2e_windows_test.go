@@ -24,6 +24,7 @@ import (
 	"github.com/melnykp/pomoc-zdalna-agent/internal/desktop/proc"
 	"github.com/melnykp/pomoc-zdalna-agent/internal/desktop/winput"
 	"github.com/melnykp/pomoc-zdalna-agent/internal/desktop/winput/hooktest"
+	"github.com/melnykp/pomoc-zdalna-agent/internal/wintoken"
 	"github.com/melnykp/pomoc-zdalna-agent/pkg/wire"
 )
 
@@ -36,7 +37,7 @@ import (
 // ownTokenLauncher uruchamia pomocnika dokładnie tą samą ścieżką co usługa (startWithToken: CreateProcessAsUser, potoki
 // jako stdin/stdout, środowisko użytkownika, winsta0\default, bez okna konsoli), ale z kopią tokenu bieżącego procesu zamiast
 // WTSQueryUserToken (ten wymaga konta SYSTEM). Różni się więc od usługi tylko źródłem tokenu.
-func ownTokenLauncher(t *testing.T) func(ctx context.Context, exe string, log *slog.Logger) (Process, error) {
+func ownTokenLauncher(t *testing.T, restrict, minimalEnv bool) func(ctx context.Context, exe string, log *slog.Logger) (Process, error) {
 	return func(_ context.Context, exe string, log *slog.Logger) (Process, error) {
 		var self windows.Token
 		if err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_DUPLICATE|windows.TOKEN_QUERY|windows.TOKEN_ASSIGN_PRIMARY, &self); err != nil {
@@ -50,7 +51,19 @@ func ownTokenLauncher(t *testing.T) func(ctx context.Context, exe string, log *s
 		defer dup.Close()
 		var session uint32
 		_ = windows.ProcessIdToSessionId(windows.GetCurrentProcessId(), &session)
-		p, err := startWithToken(dup, session, exe, log)
+		procTok := dup
+		if restrict {
+			// Ta sama operacja co w produkcji dla tokenu administratora: odjęcie uprawnień (zostaje SeChangeNotifyPrivilege).
+			// Ograniczamy token procesu wprost (nie jego kopię): zwykły proces bez SeAssignPrimaryTokenPrivilege może przekazać do
+			// CreateProcessAsUser tylko token będący ograniczoną wersją jego własnego; usługa SYSTEM ma to uprawnienie.
+			r, err := wintoken.Restrict(self, false)
+			if err != nil {
+				return nil, err
+			}
+			defer r.Close()
+			procTok = r
+		}
+		p, err := startWithToken(procTok, dup, minimalEnv, session, exe, log)
 		if err != nil && errors.Is(err, windows.ERROR_PRIVILEGE_NOT_HELD) {
 			t.Skipf("CreateProcessAsUser z kopią własnego tokenu wymaga uprawnień, których tu nie ma: %v", err)
 		}
@@ -187,7 +200,12 @@ func TestInputReachesSystemThroughHelper(t *testing.T) {
 		launch func(t *testing.T) func(ctx context.Context, exe string, log *slog.Logger) (Process, error)
 	}{
 		{"zwykły proces potomny", func(*testing.T) func(context.Context, string, *slog.Logger) (Process, error) { return launchChild }},
-		{"CreateProcessAsUser (kopia tokenu, ścieżka usługi)", ownTokenLauncher},
+		{"CreateProcessAsUser (kopia tokenu, ścieżka usługi)", func(t *testing.T) func(context.Context, string, *slog.Logger) (Process, error) {
+			return ownTokenLauncher(t, false, false)
+		}},
+		{"CreateProcessAsUser (token po odjęciu uprawnień i minimalne środowisko, jak dla wysokiej integralności)", func(t *testing.T) func(context.Context, string, *slog.Logger) (Process, error) {
+			return ownTokenLauncher(t, true, true)
+		}},
 	}
 	for i, variant := range variants {
 		t.Run(variant.name, func(t *testing.T) {
@@ -316,6 +334,16 @@ func TestInputReachesSystemThroughHelper(t *testing.T) {
 			}
 			if !strings.EqualFold(fmt.Sprint(ctxMap["window_station"]), "WinSta0") {
 				t.Fatalf("stacja okien: %v", ctxMap["window_station"])
+			}
+			if p, _ := ctxMap["priv"].(string); p != "admin" && p != "integrity" && p != "user" {
+				t.Fatalf("kontekst pomocnika nie niesie poziomu uprawnień (priv): %v", ctxMap["priv"])
+			}
+			if strings.Contains(variant.name, "odjęciu uprawnień") {
+				// Wejście działa mimo odjętych uprawnień, a pomocnik widzi (i raportuje) tylko to, co mu zostało.
+				pr, _ := ctxMap["privileges"].([]any)
+				if len(pr) != 1 || fmt.Sprint(pr[0]) != "SeChangeNotifyPrivilege" {
+					t.Fatalf("po odjęciu uprawnień pomocnik powinien mieć tylko SeChangeNotifyPrivilege: %v", pr)
+				}
 			}
 		})
 	}

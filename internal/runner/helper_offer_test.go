@@ -16,6 +16,7 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	"github.com/melnykp/pomoc-zdalna-agent/internal/config"
+	"github.com/melnykp/pomoc-zdalna-agent/internal/remote"
 	"github.com/melnykp/pomoc-zdalna-agent/pkg/releasesig"
 	"github.com/melnykp/pomoc-zdalna-agent/pkg/wire"
 )
@@ -26,6 +27,16 @@ type fakeHelper struct {
 	version  string
 	installs int
 	body     []byte
+	// stan pomocnika zgłaszany jak przez remote.Engine (runner.HelperReporter); pusty poziom = brak raportu silnika
+	level, token string
+	fallback     bool
+	session, uac string
+}
+
+func (h *fakeHelper) HelperStatus() remote.HelperStatus {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return remote.HelperStatus{Level: h.level, Token: h.token, Fallback: h.fallback, SessionLevel: h.session, UAC: h.uac}
 }
 
 func (h *fakeHelper) Version(context.Context) string {
@@ -130,6 +141,58 @@ func TestVersionsReportEngineAndHelper(t *testing.T) {
 	if p.Versions.RemoteEngine != config.RemoteEngineWebRTC || p.Versions.Helper != "0.4.0" || p.Versions.Remote != "" {
 		t.Fatalf("wersje w heartbeacie: %+v", p.Versions)
 	}
+	if p.Versions.HelperLevel != wire.HelperLevelUser || p.Versions.HelperLevelCfg != wire.HelperLevelUser || p.Versions.HelperToken != "" || p.Versions.HelperFallback {
+		t.Fatalf("poziom uprawnień pomocnika w heartbeacie: %+v (domyślnie user, bez tokenu przed pierwszym startem)", p.Versions)
+	}
+}
+
+// Heartbeat rozróżnia poziom skuteczny (z jakim wystartował silnik), zapisany w konfiguracji i token z ostatniego startu pomocnika,
+// żeby panel pokazał rzeczywistość, a nie tylko ustawienie; zapas jest widoczny.
+func TestVersionsReportEffectiveLevelConfiguredLevelAndLastToken(t *testing.T) {
+	u, h, _ := setupHelper(t)
+	h.version = "0.4.3"
+	h.level, h.token, h.fallback = wire.HelperLevelIntegrity, "user-fallback", true
+	h.session, h.uac = wire.HelperLevelIntegrity, "off"
+	u.opts.Cfg.RemoteEngine = config.RemoteEngineWebRTC
+	u.opts.Cfg.DesktopHelperLevel = config.DesktopHelperAdmin // zapisane po starcie silnika, działa dopiero po restarcie
+	startWithRemote(t, u.env, &fakeDesktop{installed: true})
+
+	hb := next(t, u.srv, wire.TypeHeartbeat)
+	var p wire.Heartbeat
+	if err := json.Unmarshal(hb.D, &p); err != nil {
+		t.Fatal(err)
+	}
+	v := p.Versions
+	if v.HelperLevel != wire.HelperLevelIntegrity || v.HelperLevelCfg != wire.HelperLevelAdmin || v.HelperToken != "user-fallback" || !v.HelperFallback {
+		t.Fatalf("wersje w heartbeacie: %+v", v)
+	}
+	// Podniesienie na czas sesji (zgoda użytkownika) i stan UAC są osobnymi polami od stałego poziomu komputera.
+	if v.HelperLevelSession != wire.HelperLevelIntegrity || v.UAC != "off" {
+		t.Fatalf("poziom sesji i UAC w heartbeacie: %+v", v)
+	}
+	// Brak podniesienia jest wysyłany jawnie jako pusty tekst (nie pomijany), żeby serwer mógł zdjąć podniesienie po końcu sesji.
+	if !strings.Contains(string(hb.D), `"helper_level_session":"integrity"`) {
+		t.Fatalf("surowy heartbeat: %s", hb.D)
+	}
+}
+
+// Wybór „user” w konfiguracji trafia do serwera w heartbeacie, żeby panel pokazał faktyczny poziom.
+func TestVersionsReportHelperLevelUser(t *testing.T) {
+	u, h, _ := setupHelper(t)
+	h.version = "0.4.0"
+	u.opts.Cfg.RemoteEngine = config.RemoteEngineWebRTC
+	u.opts.Cfg.DesktopHelperLevel = config.DesktopHelperUser
+	h.level = wire.HelperLevelUser
+	startWithRemote(t, u.env, &fakeDesktop{installed: true})
+
+	hb := next(t, u.srv, wire.TypeHeartbeat)
+	var p wire.Heartbeat
+	if err := json.Unmarshal(hb.D, &p); err != nil {
+		t.Fatal(err)
+	}
+	if p.Versions.HelperLevel != wire.HelperLevelUser {
+		t.Fatalf("poziom uprawnień pomocnika w heartbeacie: %q", p.Versions.HelperLevel)
+	}
 }
 
 // Przy włączonym własnym silniku oferta klienta RustDesk (remote_module) jest pomijana: plik RustDeska nie może trafić na
@@ -158,5 +221,18 @@ loop:
 	}
 	if installs, _, _ := mod.snapshot(); installs != 0 {
 		t.Fatalf("RustDesk zainstalowany mimo własnego silnika: %d", installs)
+	}
+}
+
+// Bez podniesienia w sesji heartbeat niesie JAWNIE pusty poziom sesji (nie pomija pola), żeby serwer zdjął podniesienie po końcu sesji.
+func TestHeartbeatAlwaysCarriesSessionLevelEvenWhenEmpty(t *testing.T) {
+	u, h, _ := setupHelper(t)
+	h.version = "0.4.3"
+	h.level = wire.HelperLevelUser
+	u.opts.Cfg.RemoteEngine = config.RemoteEngineWebRTC
+	startWithRemote(t, u.env, &fakeDesktop{installed: true})
+	hb := next(t, u.srv, wire.TypeHeartbeat)
+	if !strings.Contains(string(hb.D), `"helper_level_session":""`) {
+		t.Fatalf("pusty poziom sesji ma być wysłany jawnie: %s", hb.D)
 	}
 }

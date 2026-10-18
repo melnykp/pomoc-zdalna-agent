@@ -8,7 +8,7 @@ import (
 )
 
 // launchHelper poza Windows uruchamia pomocnika jako proces potomny (tylko do testów; silnik działa w Windows).
-func launchHelper(ctx context.Context, exe string, log *slog.Logger) (Process, error) {
+func launchHelper(ctx context.Context, exe string, log *slog.Logger, _ string, _ func(TokenChoice)) (Process, error) {
 	return launchChild(ctx, exe, log)
 }
 

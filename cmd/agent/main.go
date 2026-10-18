@@ -162,9 +162,16 @@ func serve(asService bool) error {
 		// Pomocnik własnego silnika jest instalowany (komponent desktop_helper) niezależnie od włączonego silnika, żeby
 		// przełączenie na własny silnik (config.set remote_engine + restart) zastało plik już na miejscu.
 		eng := remote.NewEngine(remote.DefaultHelperExe(), log)
+		eng.HelperLevel = cfg.HelperLevel()
 		eng.OnCandidate = func(sessionID, candidate, sdpMid string) {
 			if run := rr.Load(); run != nil {
 				run.SendRemoteSignal(wire.RemoteSignal{SessionID: sessionID, Kind: wire.SignalCandidate, Candidate: candidate, SDPMid: sdpMid})
+			}
+		}
+		// Każdy start pomocnika pod usługą trafia do audytu serwera z rodzajem tokenu (rozbieżności z udzieloną zgodą wychodzą na jaw).
+		eng.OnHelperStart = func(sessionID string, c remote.TokenChoice, level string, byRequest bool) {
+			if run := rr.Load(); run != nil {
+				run.SendRemoteHelper(wire.RemoteHelper{SessionID: sessionID, Token: c.Kind, Level: level, Fallback: c.Fallback, ByRequest: byRequest})
 			}
 		}
 		helper = eng

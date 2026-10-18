@@ -19,12 +19,13 @@ func TestValidate(t *testing.T) {
 	}
 
 	cases := map[string]func(*Config){
-		"brak server_url":   func(c *Config) { c.ServerURL = "" },
-		"http do internetu": func(c *Config) { c.ServerURL = "http://agent.example.pl" },
-		"heartbeat za mały": func(c *Config) { c.HeartbeatSeconds = 1 },
-		"inventory za duży": func(c *Config) { c.InventoryHours = 1000 },
-		"zły pierścień":     func(c *Config) { c.Ring = "beta" },
-		"zły poziom logów":  func(c *Config) { c.LogLevel = "verbose" },
+		"brak server_url":      func(c *Config) { c.ServerURL = "" },
+		"http do internetu":    func(c *Config) { c.ServerURL = "http://agent.example.pl" },
+		"heartbeat za mały":    func(c *Config) { c.HeartbeatSeconds = 1 },
+		"inventory za duży":    func(c *Config) { c.InventoryHours = 1000 },
+		"zły pierścień":        func(c *Config) { c.Ring = "beta" },
+		"zły poziom logów":     func(c *Config) { c.LogLevel = "verbose" },
+		"zły poziom pomocnika": func(c *Config) { c.DesktopHelperLevel = "system" },
 	}
 	for name, mutate := range cases {
 		c := Default()
@@ -33,6 +34,37 @@ func TestValidate(t *testing.T) {
 		if err := c.Validate(); err == nil {
 			t.Errorf("%s: konfiguracja powinna być odrzucona", name)
 		}
+	}
+}
+
+// Poziom uprawnień pomocnika: pusty to „user” (średnia integralność, jak dotąd: żadna aktualizacja nie podnosi uprawnień po cichu),
+// „integrity” i „admin” trzeba włączyć świadomie; SYSTEM nie jest dostępny jako wybór (etap 1b).
+func TestHelperLevelDefaultsToUser(t *testing.T) {
+	c := Default()
+	c.ServerURL = "https://agent.example.pl"
+	for level, want := range map[string]string{"": DesktopHelperUser, DesktopHelperIntegrity: DesktopHelperIntegrity, DesktopHelperAdmin: DesktopHelperAdmin, DesktopHelperUser: DesktopHelperUser} {
+		c.DesktopHelperLevel = level
+		if err := c.Validate(); err != nil {
+			t.Fatalf("poziom %q odrzucony: %v", level, err)
+		}
+		if got := c.HelperLevel(); got != want {
+			t.Fatalf("poziom %q → %q, oczekiwano %q", level, got, want)
+		}
+	}
+	c.DesktopHelperLevel = "system"
+	if err := c.Validate(); err == nil {
+		t.Fatal("poziom SYSTEM nie jest dopuszczalny")
+	}
+
+	// Zapis i odczyt zachowują wybór; brak pola w pliku to domyślny user (starsze konfiguracje).
+	path := filepath.Join(t.TempDir(), "config.json")
+	c.DesktopHelperLevel = DesktopHelperUser
+	if err := Save(path, c); err != nil {
+		t.Fatal(err)
+	}
+	out, err := Load(path)
+	if err != nil || out.HelperLevel() != DesktopHelperUser {
+		t.Fatalf("po odczycie: %+v err=%v", out, err)
 	}
 }
 

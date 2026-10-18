@@ -102,6 +102,8 @@ type Session struct {
 	remoteFP string
 	verified int
 	inputOff atomic.Bool
+	// inputPaused: wejście od widza chwilowo ignorowane (pytanie użytkownika o zgodę trwa); steruje tym usługa przez DesktopPause/Resume.
+	inputPaused atomic.Bool
 
 	// Punkty podmiany w testach: certyfikat zdalny, uruchomienie silnika, odstęp prób weryfikacji.
 	remoteCert func() []byte
@@ -475,6 +477,22 @@ func (s *Session) sendJSON(dc *webrtc.DataChannel, v any) {
 	}
 }
 
+// PauseInput wstrzymuje (albo wznawia) wstrzykiwanie wejścia od widza. Przy wstrzymaniu wciśnięte klawisze i przyciski są puszczane, a
+// kolejne ramki sterujące odrzucane (z wpisem w statystykach odrzuceń); ping, puszczenie klawiszy i zmiana monitora nadal działają.
+func (s *Session) PauseInput(on bool) {
+	if s.inputPaused.Swap(on) == on {
+		return
+	}
+	if on {
+		if n := s.pressd.ReleaseAll(s.o.Injector); n > 0 {
+			s.log.Debug("puszczono klawisze przy wstrzymaniu wejścia", "count", n)
+		}
+		s.log.Info("wejście od widza wstrzymane na czas pytania o zgodę")
+	} else {
+		s.log.Info("wejście od widza wznowione")
+	}
+}
+
 func (s *Session) onInput(raw []byte) {
 	if s.inputOff.Load() {
 		return // po zakończeniu sesji nic już nie wstrzykujemy, nawet gdy kanał jeszcze dowozi ramki
@@ -522,6 +540,10 @@ func (s *Session) onInput(raw []byte) {
 	}
 	if s.o.Injector == nil {
 		s.rejectInput("ctrl", "tylko podgląd: wstrzykiwanie wejścia wyłączone w tej sesji")
+		return
+	}
+	if s.inputPaused.Load() {
+		s.rejectInput("ctrl", "wejście wstrzymane na czas pytania użytkownika o zgodę")
 		return
 	}
 	handled, err := Apply(s.o.Injector, s.pressd, m)

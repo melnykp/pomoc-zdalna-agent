@@ -56,6 +56,18 @@ var (
 	procTimeBeginP  = windows.NewLazySystemDLL("winmm.dll").NewProc("timeBeginPeriod")
 )
 
+// RestrictDLLSearch ogranicza domyślne wyszukiwanie bibliotek DLL do System32 i katalogu programu (SetDefaultDllDirectories
+// z LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_APPLICATION_DIR): ani bieżący katalog, ani PATH nie są przeszukiwane, więc DLL
+// podstawiona w katalogu użytkownika nie załaduje się do pomocnika o wysokiej integralności. Wołać na samym początku procesu.
+func RestrictDLLSearch() error {
+	const searchSystem32, searchApplicationDir = 0x00000800, 0x00000200
+	r, _, e := windows.NewLazySystemDLL("kernel32.dll").NewProc("SetDefaultDllDirectories").Call(searchSystem32 | searchApplicationDir)
+	if r == 0 {
+		return e
+	}
+	return nil
+}
+
 // SetDPIAware włącza tryb per-monitor v2, żeby współrzędne ekranu były w prawdziwych pikselach.
 func SetDPIAware() {
 	// DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4

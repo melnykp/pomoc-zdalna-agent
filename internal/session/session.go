@@ -80,6 +80,12 @@ func Handshake(ctx context.Context, conn transport.Conn, p Params) (Info, error)
 		RemoteModuleVersion: p.Versions.Remote,
 		HelperVersion:       p.Versions.Helper,
 		RemoteEngine:        p.Versions.RemoteEngine,
+		HelperLevel:         p.Versions.HelperLevel,
+		HelperLevelCfg:      p.Versions.HelperLevelCfg,
+		HelperToken:         p.Versions.HelperToken,
+		HelperFallback:      p.Versions.HelperFallback,
+		HelperLevelSession:  p.Versions.HelperLevelSession,
+		UAC:                 p.Versions.UAC,
 		Caps:                p.Caps,
 		Sig:                 protocol.EncodeSig(sig),
 	})

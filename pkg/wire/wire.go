@@ -38,6 +38,10 @@ const (
 	TypeRemoteOTP        = "remote.otp"
 	TypeRemoteState      = "remote.state"
 	TypeRemoteSignal     = "remote.signal"
+	TypeRemoteElevate    = "remote.elevate"       // serwer → agent: prośba inżyniera o podniesienie uprawnień pomocnika w tej sesji
+	TypeRemoteElevation  = "remote.elevation"     // agent → serwer: wynik prośby (zgoda, odmowa, brak odpowiedzi…)
+	TypeRemoteElevAck    = "remote.elevation.ack" // serwer → agent: serwer zapisał zgodę w audycie (dopiero po tym agent podnosi poziom pomocnika)
+	TypeRemoteHelper     = "remote.helper"        // agent → serwer: pomocnik wystartował w sesji (rodzaj tokenu), do audytu
 	TypeUpdateStatus     = "update.status"
 	TypeReleaseAvailable = "release.available"
 	TypeReleaseRequest   = "release.request"
@@ -81,6 +85,23 @@ const (
 const (
 	RemoteEngineRustDesk = "rustdesk"
 	RemoteEngineWebRTC   = "webrtc"
+)
+
+// Poziomy uprawnień pomocnika pulpitu (ConfigSetPayload.DesktopHelperLevel, Versions.HelperLevel).
+const (
+	HelperLevelIntegrity = "integrity"
+	HelperLevelAdmin     = "admin"
+	HelperLevelUser      = "user"
+)
+
+// Rodzaje tokenu pomocnika zgłaszane po ostatnim starcie (Versions.HelperToken); serwer waliduje je listą.
+const (
+	HelperTokenIntegrity     = "integrity"
+	HelperTokenAdminLinked   = "admin-linked"
+	HelperTokenAdminFull     = "admin-full"
+	HelperTokenUserRequested = "user-requested"
+	HelperTokenUserStandard  = "user-standard"
+	HelperTokenUserFallback  = "user-fallback"
 )
 
 // Rodzaje sygnalizacji WebRTC (RemoteSignal.Kind). Oferta idzie od widza przez serwer do agenta, odpowiedź wraca tą samą
@@ -261,6 +282,8 @@ type ConfigSetPayload struct {
 	Whitelist  []string `json:"whitelist,omitempty"`
 	// RemoteEngine wybiera silnik pulpitu (RemoteEngine*); zmiana działa od następnego startu agenta.
 	RemoteEngine *string `json:"remote_engine,omitempty"`
+	// DesktopHelperLevel wybiera poziom uprawnień pomocnika (HelperLevel*); zmiana działa od następnego startu agenta.
+	DesktopHelperLevel *string `json:"desktop_helper_level,omitempty"`
 }
 
 // ICEServer to wpis konfiguracji ICE (STUN/TURN) przekazywany obu stronom połączenia WebRTC.
@@ -282,6 +305,60 @@ type RemoteSignal struct {
 	Fingerprint string      `json:"fingerprint,omitempty"`
 	ICEServers  []ICEServer `json:"ice_servers,omitempty"`
 	Error       string      `json:"error,omitempty"`
+}
+
+// Stany wyniku prośby o podniesienie uprawnień (RemoteElevation.State).
+const (
+	// ElevationGranted: użytkownik na komputerze zezwolił; pomocnik zostaje uruchomiony ponownie na poziomie integrity do końca sesji.
+	ElevationGranted = "granted"
+	// ElevationDenied: użytkownik odmówił.
+	ElevationDenied = "denied"
+	// ElevationTimeout: brak odpowiedzi użytkownika w czasie (odmowa).
+	ElevationTimeout = "timeout"
+	// ElevationAlready: pomocnik jest już podwyższony (stały poziom komputera albo wcześniejsza zgoda w tej sesji).
+	ElevationAlready = "already"
+	// ElevationUnavailable: nie ma jak zapytać użytkownika (agent nie jest usługą, nikt nie jest zalogowany, okno się nie pokazało).
+	ElevationUnavailable = "unavailable"
+	// ElevationError: inny błąd (sesja nie jest połączona, trwa inna prośba, zgoda bez efektu).
+	ElevationError = "error"
+)
+
+// RemoteElevate to prośba o podniesienie uprawnień pomocnika w trwającej sesji (serwer → agent). Engineer to nazwa inżyniera do
+// pokazania użytkownikowi w oknie zgody; RequestID łączy prośbę z odpowiedzią.
+type RemoteElevate struct {
+	SessionID string `json:"session_id"`
+	RequestID string `json:"request_id"`
+	// Engineer to nazwa wyświetlana inżyniera, EngineerLogin jego login (e-mail), Tenant nazwa firmy (klienta) komputera: wszystko z serwera, do
+	// pokazania w oknie zgody w osobnych, podpisanych liniach.
+	Engineer      string `json:"engineer"`
+	EngineerLogin string `json:"engineer_login,omitempty"`
+	Tenant        string `json:"tenant,omitempty"`
+}
+
+// RemoteElevationAck to potwierdzenie serwera, że wynik prośby (zgoda) został zapisany w audycie (serwer → agent). Agent podnosi poziom
+// pomocnika dopiero po Accepted=true; brak potwierdzenia (zerwane połączenie, prośba wygasła) oznacza, że nic się nie podnosi.
+type RemoteElevationAck struct {
+	SessionID string `json:"session_id"`
+	RequestID string `json:"request_id"`
+	Accepted  bool   `json:"accepted"`
+}
+
+// RemoteHelper to zgłoszenie startu pomocnika w sesji (agent → serwer), do audytu: z jakim tokenem pomocnik naprawdę wystartował. ByRequest
+// mówi, że poziom podniesiono na mocy zgody na prośbę w tej sesji; Level to stały poziom komputera.
+type RemoteHelper struct {
+	SessionID string `json:"session_id"`
+	Token     string `json:"token"`
+	Level     string `json:"level"`
+	Fallback  bool   `json:"fallback,omitempty"`
+	ByRequest bool   `json:"by_request,omitempty"`
+}
+
+// RemoteElevation to wynik prośby (agent → serwer). Reason to krótki opis dla inżyniera i audytu.
+type RemoteElevation struct {
+	SessionID string `json:"session_id"`
+	RequestID string `json:"request_id"`
+	State     string `json:"state"`
+	Reason    string `json:"reason,omitempty"`
 }
 
 // RemoteStats to podsumowanie sesji własnego silnika do audytu (RemoteState.Stats przy rozłączeniu).
@@ -309,6 +386,18 @@ type Versions struct {
 	Helper string `json:"helper,omitempty"`
 	// RemoteEngine to włączony silnik pulpitu (RemoteEngine*); pusty tekst u starszych agentów oznacza RustDesk.
 	RemoteEngine string `json:"remote_engine,omitempty"`
+	// HelperLevel to skuteczny poziom uprawnień pomocnika: ten, z którym agent wystartował (HelperLevel*), a nie dopiero zapisany w
+	// konfiguracji. HelperLevelCfg to poziom zapisany w config.json (różni się do restartu agenta).
+	HelperLevel    string `json:"helper_level,omitempty"`
+	HelperLevelCfg string `json:"helper_level_cfg,omitempty"`
+	// HelperToken i HelperFallback to rodzaj tokenu z ostatniego startu pomocnika (HelperToken*); puste przed pierwszym startem.
+	HelperToken    string `json:"helper_token,omitempty"`
+	HelperFallback bool   `json:"helper_fallback,omitempty"`
+	// HelperLevelSession to poziom pomocnika podniesiony na czas trwającej sesji za zgodą użytkownika (HelperLevel*); PUSTY tekst znaczy
+	// „brak podniesienia” i jest wysyłany zawsze, żeby serwer mógł zdjąć podniesienie po końcu sesji.
+	HelperLevelSession string `json:"helper_level_session"`
+	// UAC to stan kontroli konta użytkownika na komputerze: "on" | "off" (EnableLUA=0); pusty = nieznany.
+	UAC string `json:"uac,omitempty"`
 }
 
 // Auth to odpowiedź agenta na Hello; Sig to base64 podpisu Ed25519 urządzenia
@@ -321,6 +410,12 @@ type Auth struct {
 	RemoteModuleVersion string   `json:"remote_module_version"`
 	HelperVersion       string   `json:"helper_version,omitempty"`
 	RemoteEngine        string   `json:"remote_engine,omitempty"`
+	HelperLevel         string   `json:"helper_level,omitempty"`
+	HelperLevelCfg      string   `json:"helper_level_cfg,omitempty"`
+	HelperToken         string   `json:"helper_token,omitempty"`
+	HelperFallback      bool     `json:"helper_fallback,omitempty"`
+	HelperLevelSession  string   `json:"helper_level_session"`
+	UAC                 string   `json:"uac,omitempty"`
 	Caps                []string `json:"caps"`
 	Sig                 string   `json:"sig"`
 }

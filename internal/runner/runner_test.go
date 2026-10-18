@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -245,6 +246,46 @@ func TestConfigSetIsValidatedSavedAndApplied(t *testing.T) {
 	saved, err := config.Load(e.cfgPath)
 	if err != nil || saved.HeartbeatSeconds != 45 || saved.InventoryHours != 12 {
 		t.Fatalf("zapisana konfiguracja: %+v err=%v", saved, err)
+	}
+}
+
+// Poziom uprawnień pomocnika zmienia się przez config.set: nieznana wartość (np. SYSTEM) jest odrzucana w całości,
+// poprawna zapisywana i zwracana w wyniku.
+func TestConfigSetHelperLevel(t *testing.T) {
+	e := setup(t, "approved")
+	r, _ := start(t, e)
+	waitFor(t, "kanał", func() bool { return e.srv.Connected(deviceID) })
+	if r.Config().HelperLevel() != config.DesktopHelperUser {
+		t.Fatalf("domyślny poziom pomocnika: %q", r.Config().HelperLevel())
+	}
+
+	if err := e.srv.Send(deviceID, cmd(t, "h-bad", wire.CmdConfigSet, map[string]any{"desktop_helper_level": "system"})); err != nil {
+		t.Fatal(err)
+	}
+	var bad wire.CmdResult
+	if err := next(t, e.srv, wire.TypeCmdResult).Decode(&bad); err != nil || bad.OK {
+		t.Fatalf("poziom system powinien być odrzucony: %+v err=%v", bad, err)
+	}
+	if r.Config().DesktopHelperLevel != "" {
+		t.Fatal("odrzucona zmiana nie może zmienić konfiguracji")
+	}
+
+	for i, level := range []string{"user", "admin", "integrity"} {
+		if err := e.srv.Send(deviceID, cmd(t, fmt.Sprintf("h-ok-%d", i), wire.CmdConfigSet, map[string]any{"desktop_helper_level": level})); err != nil {
+			t.Fatal(err)
+		}
+		var ok wire.CmdResult
+		if err := next(t, e.srv, wire.TypeCmdResult).Decode(&ok); err != nil || !ok.OK {
+			t.Fatalf("poprawna zmiana na %q: %+v err=%v", level, ok, err)
+		}
+		var res map[string]any
+		if err := json.Unmarshal(ok.Result, &res); err != nil || res["desktop_helper_level"] != level {
+			t.Fatalf("wynik: %s err=%v", ok.Result, err)
+		}
+		saved, err := config.Load(e.cfgPath)
+		if err != nil || saved.DesktopHelperLevel != level {
+			t.Fatalf("zapisana konfiguracja: %+v err=%v", saved, err)
+		}
 	}
 }
 

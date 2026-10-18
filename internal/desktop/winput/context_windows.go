@@ -8,6 +8,8 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/windows"
+
+	"github.com/melnykp/pomoc-zdalna-agent/internal/wintoken"
 )
 
 var (
@@ -55,12 +57,19 @@ type ProcessContext struct {
 	ThreadDesktop  string `json:"thread_desktop"`
 	InputDesktop   string `json:"input_desktop"`
 	InputDesktopOK bool   `json:"input_desktop_ok"`
+	// Priv to poziom uprawnień pomocnika dla widza: "admin" (grupa Administratorzy włączona, integralność wysoka), "integrity"
+	// (integralność wysoka BEZ włączonej grupy Administratorzy) albo "user" (poniżej wysokiej).
+	Priv string `json:"priv"`
+	// AdminGroup: grupa Administratorzy jest w tokenie włączona (nie tylko „do odmowy”).
+	AdminGroup bool `json:"admin_group"`
+	// Privileges to uprawnienia (przywileje) tokenu pomocnika: po odjęciu zostaje tylko SeChangeNotifyPrivilege.
+	Privileges []string `json:"privileges,omitempty"`
 }
 
 // String to jedna linia do dziennika.
 func (c ProcessContext) String() string {
-	return fmt.Sprintf("użytkownik=%s sesja=%d integralność=%s(0x%X) podniesiony=%v typ=%s stacja=%q pulpit wątku=%q pulpit wejściowy=%q",
-		c.User, c.SessionID, c.Integrity, c.IntegrityRID, c.Elevated, c.ElevationType, c.WindowStation, c.ThreadDesktop, c.InputDesktop)
+	return fmt.Sprintf("użytkownik=%s sesja=%d uprawnienia=%s grupa_admin=%v integralność=%s(0x%X) podniesiony=%v typ=%s stacja=%q pulpit wątku=%q pulpit wejściowy=%q przywileje=%v",
+		c.User, c.SessionID, c.Priv, c.AdminGroup, c.Integrity, c.IntegrityRID, c.Elevated, c.ElevationType, c.WindowStation, c.ThreadDesktop, c.InputDesktop, c.Privileges)
 }
 
 // tokenIntegrity zwraca RID poziomu integralności tokenu (0, gdy nie da się odczytać).
@@ -116,6 +125,17 @@ func Context() ProcessContext {
 	c.Integrity = IntegrityName(c.IntegrityRID)
 	c.Elevated = tok.IsElevated()
 	c.ElevationType = elevationType(tok)
+	if info, err := wintoken.Inspect(tok); err == nil {
+		c.AdminGroup = info.AdminEnabled
+	}
+	c.Priv = "user"
+	if c.IntegrityRID >= ridHigh {
+		c.Priv = "integrity"
+		if c.AdminGroup {
+			c.Priv = "admin"
+		}
+	}
+	c.Privileges = tokenPrivilegeNames(tok)
 	if h, _, _ := procGetProcessWinStn.Call(); h != 0 {
 		c.WindowStation = userObjectName(h)
 	}
@@ -124,6 +144,31 @@ func Context() ProcessContext {
 		c.InputDesktop, c.InputDesktopOK = n, true
 	}
 	return c
+}
+
+var procLookupPrivilegeName = windows.NewLazySystemDLL("advapi32.dll").NewProc("LookupPrivilegeNameW")
+
+// tokenPrivilegeNames zwraca nazwy uprawnień obecnych w tokenie (włączonych i wyłączonych).
+func tokenPrivilegeNames(t windows.Token) []string {
+	var n uint32
+	_ = windows.GetTokenInformation(t, windows.TokenPrivileges, nil, 0, &n)
+	if n == 0 {
+		return nil
+	}
+	buf := make([]byte, n)
+	if err := windows.GetTokenInformation(t, windows.TokenPrivileges, &buf[0], n, &n); err != nil {
+		return nil
+	}
+	tp := (*windows.Tokenprivileges)(unsafe.Pointer(&buf[0]))
+	var names []string
+	for _, p := range tp.AllPrivileges() {
+		var nb [128]uint16
+		l := uint32(len(nb))
+		if r, _, _ := procLookupPrivilegeName.Call(0, uintptr(unsafe.Pointer(&p.Luid)), uintptr(unsafe.Pointer(&nb[0])), uintptr(unsafe.Pointer(&l))); r != 0 {
+			names = append(names, windows.UTF16ToString(nb[:l]))
+		}
+	}
+	return names
 }
 
 func userObjectName(h uintptr) string {

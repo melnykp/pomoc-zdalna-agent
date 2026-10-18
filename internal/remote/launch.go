@@ -20,6 +20,9 @@ type pipeProc struct {
 	wait  func()
 	once  sync.Once
 	mu    sync.Mutex
+	// pid i closeJob ustawia launch_windows (proces w obiekcie zadania KILL_ON_JOB_CLOSE); closeJob zamyka uchwyt zadania, co zabija proces.
+	pid      uint32
+	closeJob func()
 }
 
 func newPipeProc(stdin io.WriteCloser, stdout, stderr io.Reader, kill, wait func(), log *slog.Logger) *pipeProc {

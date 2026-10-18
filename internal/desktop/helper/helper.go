@@ -38,8 +38,10 @@ type Helper struct {
 
 	mu      sync.Mutex
 	session *peer.Session
-	inj     *peer.ThreadInjector
-	done    chan struct{}
+	// pauseTimer wznawia wejście po pauzie, gdy usługa nie przysłała DesktopResume.
+	pauseTimer *time.Timer
+	inj        *peer.ThreadInjector
+	done       chan struct{}
 }
 
 // New tworzy pomocnika czytającego z in i piszącego do out. Dziennik idzie do usługi komunikatami log.
@@ -123,11 +125,34 @@ func (h *Helper) Run(ctx context.Context) error {
 						h.log.Debug("kandydat ICE odrzucony", "err", err)
 					}
 				}
+			case ipc.DesktopPause, ipc.DesktopResume:
+				h.pauseInput(m.Kind == ipc.DesktopPause)
 			case ipc.DesktopStop:
 				h.stop()
 				return nil
 			}
 		}
+	}
+}
+
+// pauseTimeout to najdłuższa pauza wejścia: jeśli usługa nie przyśle DesktopResume (padła, zgubiony komunikat), pomocnik sam wznawia, żeby
+// sterowanie nie zostało wyłączone na zawsze.
+const pauseTimeout = 75 * time.Second
+
+// pauseInput wstrzymuje albo wznawia wstrzykiwanie wejścia w bieżącej sesji (pytanie użytkownika o zgodę trwa).
+func (h *Helper) pauseInput(on bool) {
+	h.mu.Lock()
+	s := h.session
+	if h.pauseTimer != nil {
+		h.pauseTimer.Stop()
+		h.pauseTimer = nil
+	}
+	if on && s != nil {
+		h.pauseTimer = time.AfterFunc(pauseTimeout, func() { h.pauseInput(false) })
+	}
+	h.mu.Unlock()
+	if s != nil {
+		s.PauseInput(on)
 	}
 }
 
