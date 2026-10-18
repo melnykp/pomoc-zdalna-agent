@@ -57,11 +57,18 @@ Push-Location (Join-Path $PSScriptRoot "..")
 try {
   go build -trimpath -ldflags $ldflags -o (Join-Path $OutDir "agent-$Version-windows-amd64.exe") ./cmd/agent
   if ($LASTEXITCODE -ne 0) { throw "go build agent: kod $LASTEXITCODE" }
+  # Pomocnik pulpitu własnego silnika (ADR-0009): osobny plik, bo tylko on niesie zależności WebRTC. Instalowany obok
+  # agent.exe jako desktop-helper.exe (ręcznie w pilocie albo jako komponent remote_module z podpisanym manifestem).
+  go build -trimpath -ldflags "-s -w -H=windowsgui -X main.version=$Version" -o (Join-Path $OutDir "desktop-helper-$Version-windows-amd64.exe") ./cmd/desktop-helper
+  if ($LASTEXITCODE -ne 0) { throw "go build desktop-helper: kod $LASTEXITCODE" }
+  # Usługa nie może wciągnąć pion (powierzchnia ataku usługi SYSTEM): sprawdzane też w CI.
+  $deps = go list -deps ./cmd/agent
+  if ($deps | Where-Object { $_ -like 'github.com/pion/*' }) { throw "agent.exe wciąga pion: zależności WebRTC wolno mieć tylko pomocnikowi" }
 } finally {
   Pop-Location
 }
 
-Get-ChildItem -Path $OutDir -Filter "agent-$Version-windows-amd64.exe" |
+Get-ChildItem -Path $OutDir -Filter "*-$Version-windows-amd64.exe" |
   Get-FileHash -Algorithm SHA256 |
   ForEach-Object { "{0}  {1}" -f $_.Hash.ToLower(), (Split-Path $_.Path -Leaf) }
 

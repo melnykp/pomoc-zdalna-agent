@@ -94,6 +94,9 @@ func Install(ctx context.Context, p Params) (Result, error) {
 			return res, fmt.Errorf("kopiowanie programu: %w", err)
 		}
 	}
+	// Pomocnik pulpitu własnego silnika (ADR-0009) NIE jest kopiowany z katalogu instalatora: plik leżący w Pobranych
+	// obok setupu nie ma żadnej weryfikacji, a trafiałby do Program Files jako program uruchamiany przez usługę. Jedyna
+	// droga to komponent remote_module z podpisanym manifestem (remote.Engine.InstallVersion zapisuje skrót).
 	if err := svc.Install(svc.ServiceName, serviceDisplay, serviceDescription, agentExe, "service"); err != nil {
 		return res, err
 	}

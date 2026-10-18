@@ -11,6 +11,9 @@ const (
 	ComponentAgent        = "agent"
 	ComponentWatchdog     = "watchdog"
 	ComponentRemoteModule = "remote_module"
+	// ComponentDesktopHelper to pomocnik pulpitu własnego silnika (desktop-helper.exe, ADR-0009). Osobny komponent, bo ma
+	// własną numerację wersji (tę samą co agent) i instaluje się niezależnie od tego, który silnik jest włączony.
+	ComponentDesktopHelper = "desktop_helper"
 )
 
 // SchemaVersion to wersja formatu manifestu.
@@ -62,7 +65,7 @@ func (m Manifest) Validate() error {
 		errs = append(errs, fmt.Errorf("manifest: nieobsługiwany schema %d", m.Schema))
 	}
 	switch m.Component {
-	case ComponentAgent, ComponentWatchdog, ComponentRemoteModule:
+	case ComponentAgent, ComponentWatchdog, ComponentRemoteModule, ComponentDesktopHelper:
 	default:
 		errs = append(errs, fmt.Errorf("manifest: nieznany komponent %q", m.Component))
 	}

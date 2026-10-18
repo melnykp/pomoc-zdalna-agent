@@ -23,6 +23,12 @@ const ProductDirName = ProductName
 // linuxDirName to katalog danych poza Windows: krótki i bez spacji.
 const linuxDirName = "pomoc-zdalna"
 
+// Silniki pulpitu (to samo co wire.RemoteEngine*; config nie importuje wire).
+const (
+	RemoteEngineRustDesk = "rustdesk"
+	RemoteEngineWebRTC   = "webrtc"
+)
+
 // Pierścienie wdrożeń.
 const (
 	RingCanary  = "canary"
@@ -39,6 +45,9 @@ type Config struct {
 	InventoryHours   int      `json:"inventory_h"`
 	Whitelist        []string `json:"whitelist"`
 	LogLevel         string   `json:"log_level"`
+	// RemoteEngine wybiera silnik pulpitu: "rustdesk" (domyślnie, pusty tekst) albo "webrtc" (własny silnik,
+	// docs/adr/0009). Zmiana działa od następnego startu agenta.
+	RemoteEngine string `json:"remote_engine,omitempty"`
 	// ServerKeys to klucze publiczne serwera zapisane przy rejestracji. Gdy do agenta wkompilowano klucze
 	// (internal/trust), mają pierwszeństwo, a te służą tylko w buildach rozwojowych.
 	ServerKeys []ServerKey `json:"server_keys,omitempty"`
@@ -131,6 +140,11 @@ func (c Config) Validate() error {
 	case "debug", "info", "warn", "error":
 	default:
 		errs = append(errs, fmt.Errorf("config: nieznany poziom logów %q", c.LogLevel))
+	}
+	switch c.RemoteEngine {
+	case "", RemoteEngineRustDesk, RemoteEngineWebRTC:
+	default:
+		errs = append(errs, fmt.Errorf("config: nieznany silnik pulpitu %q", c.RemoteEngine))
 	}
 	return errors.Join(errs...)
 }

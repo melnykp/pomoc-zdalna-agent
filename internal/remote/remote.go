@@ -13,6 +13,8 @@ import (
 	"errors"
 	"math/big"
 	"time"
+
+	"github.com/melnykp/pomoc-zdalna-agent/pkg/wire"
 )
 
 // Module to sterowanie klientem pulpitu na tym komputerze.
@@ -36,9 +38,31 @@ type Installer interface {
 	Install(ctx context.Context, installerPath string) error
 }
 
+// VersionedInstaller to moduł, który przy instalacji chce znać wersję komponentu (zapisuje ją obok pliku, żeby nie
+// uruchamiać pliku dla odczytu wersji).
+type VersionedInstaller interface {
+	InstallVersion(ctx context.Context, installerPath, version string) error
+}
+
 // Versioner to moduł, który zna wersję zainstalowanego klienta.
 type Versioner interface {
 	Version(ctx context.Context) string
+}
+
+// EngineNamer to moduł, który nazywa swój silnik dla panelu (wire.RemoteEngine*). Bez tego przyjmujemy RustDesk.
+type EngineNamer interface {
+	Engine() string
+}
+
+// Signaler to moduł z sygnalizacją WebRTC (własny silnik): oferta widza daje odpowiedź z odciskiem DTLS, kandydat
+// ICE nie daje odpowiedzi (nil).
+type Signaler interface {
+	Signal(ctx context.Context, sessionID string, sig wire.RemoteSignal) (*wire.RemoteSignal, error)
+}
+
+// SessionEnder to moduł, który przy końcu sesji zamyka własne połączenie i oddaje statystyki do audytu.
+type SessionEnder interface {
+	EndSession(ctx context.Context) *wire.RemoteStats
 }
 
 // Błędy menedżera sesji.
@@ -68,6 +92,11 @@ type Session struct {
 	OTP         string
 	ExpiresAt   time.Time
 	ConnectedAt time.Time
+	// Engine to silnik sesji (wire.RemoteEngine*), przekazywany panelowi w remote.otp.
+	Engine string
+	// ctx gaśnie z końcem sesji (sygnalizacja w toku ma się wtedy przerwać); tylko do użytku Managera.
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 // otpAlphabet pomija znaki łatwe do pomylenia (0/O, 1/l/I).

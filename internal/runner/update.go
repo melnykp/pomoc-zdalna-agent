@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"github.com/melnykp/pomoc-zdalna-agent/internal/config"
 	"runtime"
 	"time"
 
@@ -105,8 +106,26 @@ func (r *Runner) requestRelease(ctx context.Context) error {
 // handleOffer przetwarza ofertę wydania: weryfikuje podpis i zgodność, pobiera plik, sprawdza go i przekazuje
 // watchdogowi. Samą podmianę i rollback robi watchdog, bo działający agent nie może zastąpić własnego pliku.
 func (r *Runner) handleOffer(ctx context.Context, offer wire.ReleaseAvailable) {
-	if offer.Component == releasesig.ComponentRemoteModule {
-		r.handleModuleOffer(ctx, offer)
+	switch offer.Component {
+	case releasesig.ComponentRemoteModule:
+		// Klient RustDesk instaluje aktywny menedżer pulpitu. Przy własnym silniku menedżer opakowuje pomocnika, a plik
+		// RustDeska nie może trafić na jego miejsce, więc taka oferta jest odrzucana (serwer i tak jej nie wysyła).
+		if r.Config().RemoteEngine == config.RemoteEngineWebRTC {
+			r.log.Debug("oferta klienta RustDesk przy włączonym własnym silniku, pomijam", "version", offer.Version)
+			return
+		}
+		if r.o.Remote == nil {
+			return
+		}
+		r.installComponentOffer(ctx, offer, releasesig.ComponentRemoteModule, r.o.Remote, "remote", "moduł pulpitu", true)
+		return
+	case releasesig.ComponentDesktopHelper:
+		if r.o.Helper == nil {
+			return
+		}
+		// Pomocnik własnego silnika: plik ląduje obok agenta niezależnie od włączonego silnika; Prepare (zamknięcie dostępu)
+		// dotyczy tylko aktywnego menedżera i tylko wtedy, gdy to on używa pomocnika.
+		r.installComponentOffer(ctx, offer, releasesig.ComponentDesktopHelper, r.o.Helper, "helper", "pomocnik pulpitu", r.Config().RemoteEngine == config.RemoteEngineWebRTC)
 		return
 	}
 	u := r.o.Update
@@ -190,12 +209,21 @@ func (r *Runner) handleOffer(ctx context.Context, offer wire.ReleaseAvailable) {
 	r.log.Info("aktualizacja przekazana watchdogowi", "to", m.Version)
 }
 
-// handleModuleOffer przetwarza ofertę klienta pulpitu (komponent remote_module). Weryfikacja jest ta sama co przy
-// aktualizacji agenta (podpis sshsig manifestu kluczami z pliku, suma SHA-256, Authenticode ze zgodnym podmiotem), a zamiast
-// podmiany własnego pliku agent instaluje klienta cichym instalatorem producenta. Próg bezpieczeństwa agenta nie dotyczy modułu.
-func (r *Runner) handleModuleOffer(ctx context.Context, offer wire.ReleaseAvailable) {
+// ComponentInstaller instaluje komponent pulpitu z pobranego, zweryfikowanego pliku (remote.Manager dla klienta
+// RustDesk, remote.Engine dla pomocnika własnego silnika).
+type ComponentInstaller interface {
+	Version(ctx context.Context) string
+	InstallVersion(ctx context.Context, path, version string) error
+}
+
+// installComponentOffer przetwarza ofertę komponentu pulpitu (remote_module albo desktop_helper). Weryfikacja jest ta sama
+// co przy aktualizacji agenta (podpis sshsig manifestu kluczami z pliku, suma SHA-256, Authenticode ze zgodnym podmiotem),
+// a zamiast podmiany własnego pliku agent instaluje komponent (cichy instalator producenta albo kopia pomocnika obok agenta).
+// Próg bezpieczeństwa agenta nie dotyczy komponentów; cofanie wersji jest zabronione per komponent. Gdy prepare jest
+// prawdą, po instalacji aktywny menedżer zamyka dostęp (Prepare), bo to on używa zainstalowanego pliku.
+func (r *Runner) installComponentOffer(ctx context.Context, offer wire.ReleaseAvailable, component string, target ComponentInstaller, stagingPrefix, label string, prepare bool) {
 	u := r.o.Update
-	if u == nil || r.o.Remote == nil {
+	if u == nil {
 		return
 	}
 	if !r.modMu.TryLock() {
@@ -207,18 +235,18 @@ func (r *Runner) handleModuleOffer(ctx context.Context, offer wire.ReleaseAvaila
 		return
 	}
 
-	current := r.o.Remote.Version(ctx)
+	current := target.Version(ctx)
 	status := func(state, msg string) {
 		if err := r.sendTyped(ctx, wire.TypeUpdateStatus, wire.UpdateStatus{ReleaseID: offer.ReleaseID, State: state, FromVersion: current, ToVersion: offer.Version, Error: msg}); err != nil {
 			r.log.Debug("status instalacji modułu pulpitu niewysłany", "state", state, "err", err)
 		}
 	}
 	fail := func(stage string, err error) {
-		r.log.Error("instalacja modułu pulpitu odrzucona", "stage", stage, "version", offer.Version, "err", err)
+		r.log.Error("instalacja komponentu pulpitu odrzucona", "component", label, "stage", stage, "version", offer.Version, "err", err)
 		status(wire.UpdateFailed, fmt.Sprintf("%s: %v", stage, err))
 	}
 
-	planner := update.Planner{Component: releasesig.ComponentRemoteModule, Signers: u.Signers, CurrentVersion: current, ServerURL: r.Config().ServerURL, OS: runtime.GOOS, Arch: runtime.GOARCH}
+	planner := update.Planner{Component: component, Signers: u.Signers, CurrentVersion: current, ServerURL: r.Config().ServerURL, OS: runtime.GOOS, Arch: runtime.GOARCH}
 	m, err := planner.Plan(offer)
 	if errors.Is(err, update.ErrUpToDate) {
 		return
@@ -228,13 +256,13 @@ func (r *Runner) handleModuleOffer(ctx context.Context, offer wire.ReleaseAvaila
 		return
 	}
 
-	r.log.Info("pobieram moduł pulpitu", "from", current, "to", m.Version)
+	r.log.Info("pobieram komponent pulpitu", "component", label, "from", current, "to", m.Version)
 	status(wire.UpdateDownloading, "")
 	client := u.HTTP
 	if client == nil {
 		client = transport.NewHTTPClient(0)
 	}
-	dest := filepath.Join(u.Paths.Staging(), fmt.Sprintf("remote-%s.exe", m.Version))
+	dest := filepath.Join(u.Paths.Staging(), fmt.Sprintf("%s-%s.exe", stagingPrefix, m.Version))
 	dctx, cancel := context.WithTimeout(ctx, 20*time.Minute)
 	err = update.Download(dctx, client, m, dest)
 	cancel()
@@ -255,15 +283,17 @@ func (r *Runner) handleModuleOffer(ctx context.Context, offer wire.ReleaseAvaila
 	status(wire.UpdateVerified, "")
 
 	status(wire.UpdateApplying, "")
-	if err := r.o.Remote.Install(ctx, dest); err != nil {
+	if err := target.InstallVersion(ctx, dest, m.Version); err != nil {
 		// Nieudana instalacja nie jest ponawiana w pętli: wydanie trafia na lokalną listę odrzuconych.
 		_ = u.Paths.MarkBad(offer.ReleaseID)
 		fail("instalacja", err)
 		return
 	}
-	if err := r.o.Remote.Prepare(ctx); err != nil {
-		r.log.Warn("konfiguracja modułu pulpitu po instalacji nieudana", "err", err)
+	if prepare && r.o.Remote != nil {
+		if err := r.o.Remote.Prepare(ctx); err != nil {
+			r.log.Warn("konfiguracja komponentu pulpitu po instalacji nieudana", "component", label, "err", err)
+		}
 	}
 	status(wire.UpdateSuccess, "")
-	r.log.Info("moduł pulpitu zainstalowany", "version", m.Version)
+	r.log.Info("komponent pulpitu zainstalowany", "component", label, "version", m.Version)
 }

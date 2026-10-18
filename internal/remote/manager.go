@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"sync"
 	"time"
+
+	"github.com/melnykp/pomoc-zdalna-agent/pkg/wire"
 )
 
 // Granice czasu życia hasła jednorazowego (od remote.open do połączenia).
@@ -16,8 +18,9 @@ const (
 	MaxTTL     = 10 * time.Minute
 )
 
-// StateFunc dostaje zmiany stanu sesji do odesłania serwerowi (remote.state).
-type StateFunc func(sessionID, state string)
+// StateFunc dostaje zmiany stanu sesji do odesłania serwerowi (remote.state). Statystyki (nil dla RustDesk) wypełnia
+// własny silnik przy końcu sesji.
+type StateFunc func(sessionID, state string, stats *wire.RemoteStats)
 
 // Manager prowadzi sesje pulpitu: jedna naraz. Nie przechowuje hasła nigdzie poza pamięcią procesu.
 type Manager struct {
@@ -58,14 +61,46 @@ func NewManager(o Options) *Manager {
 		m.log = slog.Default()
 	}
 	if m.emit == nil {
-		m.emit = func(string, string) {}
+		m.emit = func(string, string, *wire.RemoteStats) {}
 	}
 	return m
+}
+
+// Signal przekazuje sygnalizację WebRTC widza do modułu bieżącej sesji. Oferta spoza trwającej sesji jest odrzucana
+// (ErrNoSession): to serwer trzyma, kto i kiedy może się połączyć, a agent tylko sprawdza zgodność z remote.open.
+func (m *Manager) Signal(ctx context.Context, sessionID string, sig wire.RemoteSignal) (*wire.RemoteSignal, error) {
+	sg, ok := m.mod.(Signaler)
+	if !ok {
+		return nil, ErrNoSignaling
+	}
+	m.mu.Lock()
+	if m.cur == nil || m.cur.ID != sessionID {
+		m.mu.Unlock()
+		return nil, ErrNoSession
+	}
+	if m.cur.ConnectedAt.IsZero() && !m.now().Before(m.cur.ExpiresAt) {
+		m.mu.Unlock()
+		return nil, ErrNoSession // czas na połączenie minął; pętla zaraz zamknie sesję
+	}
+	sessCtx := m.cur.ctx
+	m.mu.Unlock()
+	// Bez blokady: oferta czeka na pomocnika do kilkunastu sekund, a pętla obserwacji musi tykać. Kontekst gaśnie razem
+	// z sesją (remote.close, wygaśnięcie), żeby oferta w toku nie zostawiła pomocnika bez ewidencji.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stop := context.AfterFunc(sessCtx, cancel)
+	defer stop()
+	return sg.Signal(ctx, sessionID, sig)
 }
 
 // Install instaluje klienta pulpitu z pliku instalacyjnego (wcześniej zweryfikowanego przez wywołującego) i unieważnia
 // zapamiętaną wersję. Błąd ErrNoInstaller, gdy moduł nie umie instalować.
 func (m *Manager) Install(ctx context.Context, installerPath string) error {
+	return m.InstallVersion(ctx, installerPath, "")
+}
+
+// InstallVersion to Install ze znaną wersją komponentu (dla modułów, które ją zapisują obok pliku).
+func (m *Manager) InstallVersion(ctx context.Context, installerPath, version string) error {
 	inst, ok := m.mod.(Installer)
 	if !ok {
 		return ErrNoInstaller
@@ -76,7 +111,12 @@ func (m *Manager) Install(ctx context.Context, installerPath string) error {
 	if busy {
 		return ErrBusy // nie podmieniamy klienta w trakcie sesji
 	}
-	err := inst.Install(ctx, installerPath)
+	var err error
+	if vi, ok := m.mod.(VersionedInstaller); ok && version != "" {
+		err = vi.InstallVersion(ctx, installerPath, version)
+	} else {
+		err = inst.Install(ctx, installerPath)
+	}
 	m.verMu.Lock()
 	m.verAt = time.Time{}
 	m.verMu.Unlock()
@@ -158,7 +198,12 @@ func (m *Manager) Open(ctx context.Context, sessionID string, ttl time.Duration)
 	if err := m.mod.SetPassword(ctx, otp); err != nil {
 		return Session{}, fmt.Errorf("ustawienie hasła sesji: %w", err)
 	}
-	m.cur = &Session{ID: sessionID, RemoteID: id, OTP: otp, ExpiresAt: m.now().Add(ttl)}
+	engine := wire.RemoteEngineRustDesk
+	if n, ok := m.mod.(EngineNamer); ok {
+		engine = n.Engine()
+	}
+	sctx, scancel := context.WithCancel(context.Background())
+	m.cur = &Session{ID: sessionID, RemoteID: id, OTP: otp, ExpiresAt: m.now().Add(ttl), Engine: engine, ctx: sctx, cancel: scancel}
 	return *m.cur, nil
 }
 
@@ -217,7 +262,7 @@ func (m *Manager) Tick(ctx context.Context) {
 	switch {
 	case err == nil && connected && m.cur.ConnectedAt.IsZero():
 		m.cur.ConnectedAt = m.now()
-		m.emit(m.cur.ID, StateConnected)
+		m.emit(m.cur.ID, StateConnected, nil)
 	case err == nil && !connected && !m.cur.ConnectedAt.IsZero():
 		m.closeLocked(ctx, StateDisconnected)
 	case m.cur.ConnectedAt.IsZero() && !m.now().Before(m.cur.ExpiresAt):
@@ -228,13 +273,20 @@ func (m *Manager) Tick(ctx context.Context) {
 // closeLocked zamyka dostęp, zgłasza stan i kończy sesję. Wymaga trzymanego m.mu.
 func (m *Manager) closeLocked(ctx context.Context, state string) {
 	id := m.cur.ID
+	if m.cur.cancel != nil {
+		m.cur.cancel() // oferta w toku dla tej sesji ma się przerwać i zabić pomocnika
+	}
 	m.cur = nil
+	var stats *wire.RemoteStats
+	if e, ok := m.mod.(SessionEnder); ok {
+		stats = e.EndSession(ctx)
+	}
 	if err := m.lock(ctx); err != nil {
 		// Nie udało się zamknąć dostępu: stan sesji i tak zgłaszamy, ale głośno ostrzegamy. Hasło jednorazowe jest
 		// ważne dalej, więc próbę powtórzy kolejne Prepare (start agenta) albo następna sesja.
 		m.log.Error("nie udało się zamknąć dostępu pulpitu po sesji", "err", err, "session_id", id)
 	}
-	m.emit(id, state)
+	m.emit(id, state, stats)
 }
 
 // lock ustawia losowe hasło, którego nikt nie zna.

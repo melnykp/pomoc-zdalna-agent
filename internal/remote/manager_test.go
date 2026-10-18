@@ -9,6 +9,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/melnykp/pomoc-zdalna-agent/pkg/wire"
 )
 
 // fakeModule udaje klienta pulpitu i zapamiętuje ustawiane hasła.
@@ -72,7 +74,7 @@ type recorder struct {
 	events []string
 }
 
-func (r *recorder) emit(id, state string) {
+func (r *recorder) emit(id, state string, _ *wire.RemoteStats) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.events = append(r.events, id+":"+state)

@@ -43,6 +43,9 @@ type Options struct {
 
 	// Remote to menedżer sesji pulpitu; nil = polecenia remote.* są odrzucane (moduł pulpitu wyłączony w tej wersji).
 	Remote *remote.Manager
+	// Helper instaluje pomocnika własnego silnika (komponent desktop_helper) niezależnie od włączonego silnika, żeby
+	// przełączenie na własny silnik nie czekało na pobranie pliku; nil = oferty desktop_helper są odrzucane.
+	Helper ComponentInstaller
 
 	// OnRestart i OnRetire wywołuje runner po odesłaniu wyniku polecenia. Domyślnie nic nie robią.
 	OnRestart func()
@@ -160,9 +163,9 @@ func (r *Runner) startRemote(ctx context.Context) {
 
 // SendRemoteState zgłasza serwerowi zmianę stanu sesji pulpitu (remote.state). Przy braku połączenia ponawia kilka razy:
 // serwer i tak wygasza sesje po czasie, więc zgubiony stan nie zostawia sesji otwartej w panelu na zawsze.
-func (r *Runner) SendRemoteState(sessionID, state string) {
+func (r *Runner) SendRemoteState(sessionID, state string, stats *wire.RemoteStats) {
 	go func() {
-		msg := wire.RemoteState{SessionID: sessionID, State: state, At: time.Now().UnixMilli()}
+		msg := wire.RemoteState{SessionID: sessionID, State: state, At: time.Now().UnixMilli(), Stats: stats}
 		for attempt := 0; attempt < 5; attempt++ {
 			ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 			err := r.sendTyped(ctx, wire.TypeRemoteState, msg)
@@ -174,6 +177,43 @@ func (r *Runner) SendRemoteState(sessionID, state string) {
 		}
 		r.log.Warn("nie udało się zgłosić stanu sesji pulpitu", "session_id", sessionID, "state", state)
 	}()
+}
+
+// SendRemoteSignal przekazuje serwerowi sygnalizację WebRTC od pomocnika (kandydat ICE zebrany po odpowiedzi).
+func (r *Runner) SendRemoteSignal(sig wire.RemoteSignal) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := r.sendTyped(ctx, wire.TypeRemoteSignal, sig); err != nil {
+		r.log.Debug("sygnalizacja pulpitu niewysłana", "kind", sig.Kind, "err", err)
+	}
+}
+
+// handleRemoteSignal obsługuje sygnalizację WebRTC od serwera (oferta albo kandydat widza): odpowiedź wraca tą samą
+// wiadomością; błąd też, żeby panel nie czekał do końca limitu.
+func (r *Runner) handleRemoteSignal(ctx context.Context, sig wire.RemoteSignal) {
+	reply := func(out wire.RemoteSignal) {
+		if err := r.sendTyped(ctx, wire.TypeRemoteSignal, out); err != nil {
+			r.log.Warn("odpowiedź sygnalizacji pulpitu niewysłana", "err", err)
+		}
+	}
+	if r.o.Remote == nil {
+		reply(wire.RemoteSignal{SessionID: sig.SessionID, Kind: wire.SignalError, Error: "moduł pulpitu jest wyłączony w tej wersji agenta"})
+		return
+	}
+	out, err := r.o.Remote.Signal(ctx, sig.SessionID, sig)
+	switch {
+	case errors.Is(err, remote.ErrNoSignaling):
+		reply(wire.RemoteSignal{SessionID: sig.SessionID, Kind: wire.SignalError, Error: "ten komputer używa modułu pulpitu bez własnego silnika (RustDesk)"})
+	case errors.Is(err, remote.ErrNoSession):
+		reply(wire.RemoteSignal{SessionID: sig.SessionID, Kind: wire.SignalError, Error: "brak otwartej sesji pulpitu o tym identyfikatorze"})
+	case errors.Is(err, remote.ErrNoUserSession):
+		reply(wire.RemoteSignal{SessionID: sig.SessionID, Kind: wire.SignalError, Error: "nikt nie jest zalogowany na tym komputerze (ekran logowania nie jest jeszcze obsługiwany)"})
+	case err != nil:
+		r.log.Warn("sygnalizacja pulpitu nieudana", "kind", sig.Kind, "err", err)
+		reply(wire.RemoteSignal{SessionID: sig.SessionID, Kind: wire.SignalError, Error: err.Error()})
+	case out != nil:
+		reply(*out)
+	}
 }
 
 func sleep(ctx context.Context, d time.Duration) error {
@@ -403,10 +443,19 @@ func (r *Runner) sendHeartbeat(ctx context.Context) error {
 // (watchdog po aktualizacji agenta może być starszy, więc nie zakładamy, że jest taka sama).
 func (r *Runner) versions() wire.Versions {
 	v := r.o.Versions
-	if r.o.Remote != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	engine := r.Config().RemoteEngine
+	if engine == "" {
+		engine = config.RemoteEngineRustDesk
+	}
+	v.RemoteEngine = engine
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	// Przy własnym silniku menedżer opakowuje pomocnika, więc jego wersja nie jest wersją klienta RustDesk.
+	if r.o.Remote != nil && engine != config.RemoteEngineWebRTC {
 		v.Remote = r.o.Remote.Version(ctx)
-		cancel()
+	}
+	if r.o.Helper != nil {
+		v.Helper = r.o.Helper.Version(ctx)
 	}
 	if r.o.Update != nil {
 		if w, err := r.o.Update.Paths.ReadWatchdog(); err == nil {
@@ -468,6 +517,17 @@ func (r *Runner) readLoop(ctx context.Context, conn transport.Conn, wg *sync.Wai
 				defer wg.Done()
 				r.handleOffer(ctx, offer)
 			}()
+		case wire.TypeRemoteSignal:
+			var sig wire.RemoteSignal
+			if err := env.Decode(&sig); err != nil || sig.SessionID == "" {
+				r.log.Warn("nieprawidłowa sygnalizacja pulpitu od serwera", "err", err)
+				continue
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				r.handleRemoteSignal(ctx, sig)
+			}()
 		case wire.TypeError:
 			var e wire.ErrorMsg
 			_ = env.Decode(&e)
@@ -525,14 +585,14 @@ func (r *Runner) registerCommands() {
 		sess, err := r.o.Remote.Open(ctx, p.SessionID, time.Duration(p.TTLS)*time.Second)
 		switch {
 		case errors.Is(err, remote.ErrNotInstalled):
-			return nil, errors.New("na tym komputerze nie ma jeszcze modułu pulpitu (RustDesk)")
+			return nil, errors.New("na tym komputerze nie ma jeszcze modułu pulpitu")
 		case errors.Is(err, remote.ErrBusy):
 			return nil, errors.New("na tym komputerze trwa już inna sesja pulpitu")
 		case err != nil:
 			return nil, err
 		}
 		// Hasło jednorazowe idzie osobną wiadomością, nigdy w wyniku polecenia (wynik trafia do bazy serwera).
-		otp := wire.RemoteOTP{SessionID: sess.ID, RemoteID: sess.RemoteID, OTP: sess.OTP, ExpiresAt: sess.ExpiresAt.UnixMilli()}
+		otp := wire.RemoteOTP{SessionID: sess.ID, RemoteID: sess.RemoteID, OTP: sess.OTP, ExpiresAt: sess.ExpiresAt.UnixMilli(), Engine: sess.Engine}
 		if err := r.sendTyped(ctx, wire.TypeRemoteOTP, otp); err != nil {
 			_ = r.o.Remote.Close(ctx, sess.ID)
 			return nil, fmt.Errorf("nie udało się przekazać hasła sesji serwerowi: %w", err)
@@ -612,6 +672,9 @@ func (r *Runner) applyConfig(p wire.ConfigSetPayload) (json.RawMessage, error) {
 	if p.Whitelist != nil {
 		next.Whitelist = p.Whitelist
 	}
+	if p.RemoteEngine != nil {
+		next.RemoteEngine = *p.RemoteEngine
+	}
 	if err := next.Validate(); err != nil {
 		r.cfgMu.Unlock()
 		return nil, err
@@ -629,5 +692,5 @@ func (r *Runner) applyConfig(p wire.ConfigSetPayload) (json.RawMessage, error) {
 	case r.cfgChanged <- struct{}{}:
 	default:
 	}
-	return json.Marshal(map[string]any{"heartbeat_s": next.HeartbeatSeconds, "inventory_h": next.InventoryHours, "whitelist": len(next.Whitelist)})
+	return json.Marshal(map[string]any{"heartbeat_s": next.HeartbeatSeconds, "inventory_h": next.InventoryHours, "whitelist": len(next.Whitelist), "remote_engine": next.RemoteEngine})
 }

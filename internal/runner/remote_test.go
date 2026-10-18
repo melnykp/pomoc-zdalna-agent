@@ -49,9 +49,9 @@ func startWithRemote(t *testing.T, e *env, mod remote.Module) *remote.Manager {
 	var rr atomic.Pointer[runner.Runner]
 	mgr := remote.NewManager(remote.Options{
 		Module: mod,
-		Emit: func(sessionID, state string) {
+		Emit: func(sessionID, state string, stats *wire.RemoteStats) {
 			if r := rr.Load(); r != nil {
-				r.SendRemoteState(sessionID, state)
+				r.SendRemoteState(sessionID, state, stats)
 			}
 		},
 		Poll: 20 * time.Millisecond,

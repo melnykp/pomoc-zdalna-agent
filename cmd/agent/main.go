@@ -152,22 +152,43 @@ func serve(asService bool) error {
 	if err != nil {
 		return fmt.Errorf("zły wkompilowany klucz podpisu wydań: %w", err)
 	}
-	// Moduł pulpitu (RustDesk) tylko w Windows i tylko z wkompilowanym adresem i kluczem naszego serwera.
+	// Moduł pulpitu tylko w Windows: własny silnik (config remote_engine=webrtc, pomocnik desktop-helper.exe obok agenta)
+	// albo przejściowo RustDesk, gdy wkompilowano adres i klucz naszego serwera RustDesk.
 	var rr atomic.Pointer[runner.Runner]
 	var remoteMgr *remote.Manager
-	if runtime.GOOS == "windows" && remoteHost != "" && remoteKey != "" {
+	var module remote.Module
+	var helper runner.ComponentInstaller
+	if runtime.GOOS == "windows" {
+		// Pomocnik własnego silnika jest instalowany (komponent desktop_helper) niezależnie od włączonego silnika, żeby
+		// przełączenie na własny silnik (config.set remote_engine + restart) zastało plik już na miejscu.
+		eng := remote.NewEngine(remote.DefaultHelperExe(), log)
+		eng.OnCandidate = func(sessionID, candidate, sdpMid string) {
+			if run := rr.Load(); run != nil {
+				run.SendRemoteSignal(wire.RemoteSignal{SessionID: sessionID, Kind: wire.SignalCandidate, Candidate: candidate, SDPMid: sdpMid})
+			}
+		}
+		helper = eng
+		switch {
+		case cfg.RemoteEngine == config.RemoteEngineWebRTC:
+			module = eng
+		case remoteHost != "" && remoteKey != "":
+			module = remote.NewRustDesk(remote.DefaultExe(), remoteHost, remoteKey)
+		}
+	}
+	if module != nil {
 		remoteMgr = remote.NewManager(remote.Options{
-			Module: remote.NewRustDesk(remote.DefaultExe(), remoteHost, remoteKey),
+			Module: module,
 			Log:    log,
-			Emit: func(sessionID, state string) {
+			Emit: func(sessionID, state string, stats *wire.RemoteStats) {
 				if run := rr.Load(); run != nil {
-					run.SendRemoteState(sessionID, state)
+					run.SendRemoteState(sessionID, state, stats)
 				}
 			},
 		})
 	}
 	r := runner.New(runner.Options{
 		Remote:   remoteMgr,
+		Helper:   helper,
 		Update:   &runner.UpdateOptions{Paths: update.Paths{Root: config.DataDir()}, Signers: signers},
 		Cfg:      cfg,
 		CfgPath:  cfgPath,

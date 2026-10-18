@@ -78,6 +78,8 @@ func Handshake(ctx context.Context, conn transport.Conn, p Params) (Info, error)
 		AgentVersion:        p.Versions.Agent,
 		WatchdogVersion:     p.Versions.Watchdog,
 		RemoteModuleVersion: p.Versions.Remote,
+		HelperVersion:       p.Versions.Helper,
+		RemoteEngine:        p.Versions.RemoteEngine,
 		Caps:                p.Caps,
 		Sig:                 protocol.EncodeSig(sig),
 	})

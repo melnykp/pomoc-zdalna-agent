@@ -7,6 +7,8 @@ import (
 	"io"
 	"log/slog"
 	"time"
+
+	"github.com/melnykp/pomoc-zdalna-agent/pkg/wire"
 )
 
 // SelfTestOptions konfiguruje samotest modułu pulpitu na prawdziwym komputerze.
@@ -48,7 +50,7 @@ func SelfTest(ctx context.Context, o SelfTestOptions) error {
 	mgr := NewManager(Options{
 		Module: o.Module,
 		Log:    slog.New(slog.NewTextHandler(io.Discard, nil)),
-		Emit:   func(_, state string) { events <- state },
+		Emit:   func(_, state string, _ *wire.RemoteStats) { events <- state },
 		Poll:   poll,
 	})
 

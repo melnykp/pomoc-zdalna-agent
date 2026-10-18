@@ -37,6 +37,7 @@ const (
 	TypeCmdResultAck     = "cmd.result.ack"
 	TypeRemoteOTP        = "remote.otp"
 	TypeRemoteState      = "remote.state"
+	TypeRemoteSignal     = "remote.signal"
 	TypeUpdateStatus     = "update.status"
 	TypeReleaseAvailable = "release.available"
 	TypeReleaseRequest   = "release.request"
@@ -73,6 +74,21 @@ const (
 	UpdateSuccess     = "success"
 	UpdateRolledBack  = "rolled_back"
 	UpdateFailed      = "failed"
+)
+
+// Silniki pulpitu (RemoteOTP.Engine, ConfigSetPayload.RemoteEngine). Pusty tekst oznacza RustDesk (zgodność wstecz).
+const (
+	RemoteEngineRustDesk = "rustdesk"
+	RemoteEngineWebRTC   = "webrtc"
+)
+
+// Rodzaje sygnalizacji WebRTC (RemoteSignal.Kind). Oferta idzie od widza przez serwer do agenta, odpowiedź wraca tą samą
+// drogą; kandydaci ICE mogą dochodzić później w obu kierunkach.
+const (
+	SignalOffer     = "offer"
+	SignalAnswer    = "answer"
+	SignalCandidate = "candidate"
+	SignalError     = "error"
 )
 
 // Rodzaje zdarzeń lokalnych (Event.Kind).
@@ -208,6 +224,42 @@ type ConfigSetPayload struct {
 	HeartbeatS *int     `json:"heartbeat_s,omitempty"`
 	InventoryH *int     `json:"inventory_h,omitempty"`
 	Whitelist  []string `json:"whitelist,omitempty"`
+	// RemoteEngine wybiera silnik pulpitu (RemoteEngine*); zmiana działa od następnego startu agenta.
+	RemoteEngine *string `json:"remote_engine,omitempty"`
+}
+
+// ICEServer to wpis konfiguracji ICE (STUN/TURN) przekazywany obu stronom połączenia WebRTC.
+type ICEServer struct {
+	URLs       []string `json:"urls"`
+	Username   string   `json:"username,omitempty"`
+	Credential string   `json:"credential,omitempty"`
+}
+
+// RemoteSignal to sygnalizacja WebRTC własnego silnika pulpitu (docs/adr/0009-wlasny-silnik-pulpitu.md), przenoszona
+// w obu kierunkach uwierzytelnionym kanałem agenta. Fingerprint to odcisk DTLS (sha-256, zapis jak w SDP) strony, która
+// wysyła SDP; serwer przypina go do sesji, a druga strona sprawdza certyfikat DTLS właśnie z nim.
+type RemoteSignal struct {
+	SessionID   string      `json:"session_id"`
+	Kind        string      `json:"kind"`
+	SDP         string      `json:"sdp,omitempty"`
+	Candidate   string      `json:"candidate,omitempty"`
+	SDPMid      string      `json:"sdp_mid,omitempty"`
+	Fingerprint string      `json:"fingerprint,omitempty"`
+	ICEServers  []ICEServer `json:"ice_servers,omitempty"`
+	Error       string      `json:"error,omitempty"`
+}
+
+// RemoteStats to podsumowanie sesji własnego silnika do audytu (RemoteState.Stats przy rozłączeniu).
+type RemoteStats struct {
+	DurationMs int64  `json:"duration_ms"`
+	BytesOut   int64  `json:"bytes_out"`
+	BytesIn    int64  `json:"bytes_in"`
+	Frames     int64  `json:"frames"`
+	Encoder    string `json:"encoder,omitempty"`
+	Width      int    `json:"width,omitempty"`
+	Height     int    `json:"height,omitempty"`
+	Monitor    int    `json:"monitor"`
+	FPS        int    `json:"fps,omitempty"`
 }
 
 // ---- agent → serwer ----
@@ -216,7 +268,12 @@ type ConfigSetPayload struct {
 type Versions struct {
 	Agent    string `json:"agent"`
 	Watchdog string `json:"watchdog"`
-	Remote   string `json:"remote"`
+	// Remote to wersja klienta RustDesk (komponent remote_module); pusta, gdy włączony jest własny silnik.
+	Remote string `json:"remote"`
+	// Helper to wersja pomocnika własnego silnika (komponent desktop_helper), niezależnie od włączonego silnika.
+	Helper string `json:"helper,omitempty"`
+	// RemoteEngine to włączony silnik pulpitu (RemoteEngine*); pusty tekst u starszych agentów oznacza RustDesk.
+	RemoteEngine string `json:"remote_engine,omitempty"`
 }
 
 // Auth to odpowiedź agenta na Hello; Sig to base64 podpisu Ed25519 urządzenia
@@ -227,6 +284,8 @@ type Auth struct {
 	AgentVersion        string   `json:"agent_version"`
 	WatchdogVersion     string   `json:"watchdog_version"`
 	RemoteModuleVersion string   `json:"remote_module_version"`
+	HelperVersion       string   `json:"helper_version,omitempty"`
+	RemoteEngine        string   `json:"remote_engine,omitempty"`
 	Caps                []string `json:"caps"`
 	Sig                 string   `json:"sig"`
 }
@@ -262,14 +321,18 @@ type RemoteOTP struct {
 	RemoteID  string `json:"remote_id"`
 	OTP       string `json:"otp"`
 	ExpiresAt int64  `json:"expires_at"`
+	// Engine mówi panelowi, jak się połączyć: RemoteEngineRustDesk (albo pusty tekst) to link rustdesk://,
+	// RemoteEngineWebRTC to strona widza w panelu z sygnalizacją remote.signal.
+	Engine string `json:"engine,omitempty"`
 }
 
-// RemoteState zgłasza zmianę stanu sesji pulpitu.
+// RemoteState zgłasza zmianę stanu sesji pulpitu. Stats wypełnia własny silnik przy końcu sesji.
 type RemoteState struct {
-	SessionID string `json:"session_id"`
-	State     string `json:"state"`
-	PeerID    string `json:"peer_id"`
-	At        int64  `json:"at"`
+	SessionID string       `json:"session_id"`
+	State     string       `json:"state"`
+	PeerID    string       `json:"peer_id"`
+	At        int64        `json:"at"`
+	Stats     *RemoteStats `json:"stats,omitempty"`
 }
 
 // UpdateStatus raportuje etap aktualizacji.

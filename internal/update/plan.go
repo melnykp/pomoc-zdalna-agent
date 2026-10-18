@@ -48,7 +48,7 @@ func (p Planner) Plan(o wire.ReleaseAvailable) (releasesig.Manifest, error) {
 	if want == "" {
 		want = releasesig.ComponentAgent
 	}
-	if want != releasesig.ComponentAgent && want != releasesig.ComponentRemoteModule {
+	if want != releasesig.ComponentAgent && want != releasesig.ComponentRemoteModule && want != releasesig.ComponentDesktopHelper {
 		return releasesig.Manifest{}, fmt.Errorf("%w: %q", ErrUnsupportedComponent, want)
 	}
 	if o.Component != want {
