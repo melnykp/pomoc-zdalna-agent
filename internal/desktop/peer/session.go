@@ -59,6 +59,10 @@ type Options struct {
 	OnConfig func(mon, fps *int)
 	// Displays to lista monitorów wysyłana widzowi kanałem "meta" po jego otwarciu (do wyboru monitora).
 	Displays []DisplayInfo
+	// Input zbiera liczniki drogi wejścia (nil = sesja ma własne). Helper dokłada ten sam obiekt do hooka kontroli ruchu myszy.
+	Input *InputStats
+	// Probe czyta kontekst procesu (token, integralność, pulpity) i okno na pierwszym planie na wątku wstrzykiwania; może być nil.
+	Probe func() (proc any, fg any)
 	// RemoteFingerprint to odcisk DTLS widza przypięty przez serwer do sesji (z komunikatu start). Oferta z innym
 	// odciskiem jest odrzucana, a po połączeniu certyfikat zdalny musi dać ten sam odcisk. Pusty = bez przypięcia
 	// (tylko testy i tryb rozwojowy; oferta nadal musi nieść dokładnie jeden odcisk sha-256).
@@ -104,7 +108,10 @@ type Session struct {
 	runEngine  func(ctx context.Context) error
 	verifyPoll time.Duration
 	rejectLog  *rateLimiter // odrzucone wejście: 1 wpis na sekundę
-	sendLog    *rateLimiter // błędy SendInput: 1 wpis na sekundę
+	inputStats *InputStats
+	chanOpen   map[string]bool // kanały danych otwarte przez widza (pod mu)
+	statsEvery time.Duration   // odstęp komunikatów o wejściu w kanale meta
+	sendLog    *rateLimiter    // błędy SendInput: 1 wpis na sekundę
 
 	bytesOut atomic.Int64
 	bytesIn  atomic.Int64
@@ -166,6 +173,12 @@ func New(o Options) (*Session, error) {
 	s.runEngine = func(ctx context.Context) error { return s.o.Engine.Run(ctx, s) }
 	s.verifyPoll = defaultVerifyPoll
 	s.rejectLog = newRateLimiter(verifyRejectLogEach)
+	s.inputStats = o.Input
+	if s.inputStats == nil {
+		s.inputStats = &InputStats{}
+	}
+	s.chanOpen = map[string]bool{}
+	s.statsEvery = time.Second
 	s.sendLog = newRateLimiter(time.Second)
 	if o.Injector == nil {
 		s.log.Info("sesja tylko do podglądu: wstrzykiwanie wejścia wyłączone")
@@ -204,13 +217,14 @@ func New(o Options) (*Session, error) {
 		// Handlery rejestrujemy ZAWSZE: certyfikat DTLS widza bywa dostępny chwilę po otwarciu kanału, a handler
 		// niezarejestrowany w tej chwili nie wróciłby już nigdy (wideo płynęłoby, a wejście, kursor i monitory nie).
 		// Bramka weryfikacji stoi w chwili użycia.
-		dc.OnOpen(func() { s.log.Info("kanał danych otwarty", "channel", label) })
+		dc.OnOpen(func() { s.markChannel(label, true) })
+		dc.OnClose(func() { s.markChannel(label, false) })
 		switch label {
 		case chanCtrl, chanMouse:
 			dc.OnMessage(func(m webrtc.DataChannelMessage) { s.onChannelMessage(label, m.Data) })
 		case chanCursor:
 			dc.OnOpen(func() {
-				s.log.Info("kanał danych otwarty", "channel", label)
+				s.markChannel(label, true)
 				s.whenVerified(label, func() {
 					s.mu.Lock()
 					s.cursor = dc
@@ -224,7 +238,7 @@ func New(o Options) (*Session, error) {
 			})
 		case chanMeta:
 			dc.OnOpen(func() {
-				s.log.Info("kanał danych otwarty", "channel", label)
+				s.markChannel(label, true)
 				s.whenVerified(label, func() {
 					s.mu.Lock()
 					s.meta = dc
@@ -333,6 +347,7 @@ func (s *Session) start() {
 			s.log.Error("silnik zakończony błędem", "err", err)
 		}
 	}()
+	go s.inputStatsLoop(ctx.Done())
 	if s.o.OnState != nil {
 		s.o.OnState(StateConnected, s.Stats())
 	}
@@ -509,7 +524,13 @@ func (s *Session) onInput(raw []byte) {
 		s.rejectInput("ctrl", "tylko podgląd: wstrzykiwanie wejścia wyłączone w tej sesji")
 		return
 	}
-	if _, err := Apply(s.o.Injector, s.pressd, m); err != nil {
+	handled, err := Apply(s.o.Injector, s.pressd, m)
+	switch {
+	case !handled:
+	case err != nil:
+		s.inputStats.NoteError(err.Error())
 		s.logInputError(m.T, err)
+	default:
+		s.inputStats.Injected.Add(1)
 	}
 }

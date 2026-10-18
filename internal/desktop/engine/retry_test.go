@@ -105,3 +105,13 @@ func TestOpenRetryDefaultsMatchRequirement(t *testing.T) {
 		t.Fatalf("domyślne ponawianie: %+v", openRetry)
 	}
 }
+
+func TestRetryOpenExplainsUnavailableInputDesktop(t *testing.T) {
+	// OpenInputDesktop odmówił (pulpit zabezpieczony): nazwa pusta, a komunikat mówi wprost, co to znaczy.
+	_, err := retryOpen(context.Background(), retryPolicy{Attempts: 2, Interval: time.Millisecond}, quiet(), "duplikacja",
+		func() (string, error) { return "", errors.New("OpenInputDesktop: Access is denied.") },
+		func() (int, error) { return 0, accessDenied }, nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "niedostępny") || !strings.Contains(err.Error(), "0x80070005") {
+		t.Fatalf("błąd: %v", err)
+	}
+}

@@ -4,6 +4,8 @@ package winput
 
 import (
 	"fmt"
+	"sync"
+	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -74,7 +76,43 @@ type keyInputT struct {
 // Injector wstrzykuje wejście; współrzędne znormalizowane odnoszą się do monitora o prostokącie Mon.
 type Injector struct {
 	MonLeft, MonTop, MonW, MonH int
+
+	// Check dostaje po każdym ruchu myszy cel i położenie kursora odczytane zaraz po SendInput. Rozbieżność (kursor się
+	// nie przesunął) to ślad po cichym odrzuceniu wejścia (UIPI, zły pulpit); SendInput w takim razie zwykle zgłasza sukces.
+	Check func(wantX, wantY, gotX, gotY int)
+
+	mu sync.Mutex
 }
+
+// SetMonitor zmienia monitor, względem którego liczone są współrzędne 0..1 (atomowo względem ruchów myszy).
+func (j *Injector) SetMonitor(left, top, w, h int) {
+	j.mu.Lock()
+	j.MonLeft, j.MonTop, j.MonW, j.MonH = left, top, w, h
+	j.mu.Unlock()
+}
+
+func (j *Injector) monitor() (left, top, w, h int) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.MonLeft, j.MonTop, j.MonW, j.MonH
+}
+
+// SendInputError to nieudane wywołanie SendInput razem z kontekstem potrzebnym do diagnozy: kod błędu systemu oraz pulpit
+// wątku i pulpit wejściowy (SendInput działa na pulpicie wątku; ERROR_ACCESS_DENIED przy innym niż wejściowy).
+type SendInputError struct {
+	Op            string // "mysz" | "klawisz"
+	Errno         syscall.Errno
+	Sent          uintptr // ile zdarzeń przyjął system (0 przy błędzie)
+	ThreadDesktop string
+	InputDesktop  string
+}
+
+func (e *SendInputError) Error() string {
+	return fmt.Sprintf("SendInput(%s): przyjęto %d z 1, błąd systemu %d (%v), pulpit wątku %q, pulpit wejściowy %q", e.Op, e.Sent, uint32(e.Errno), e.Errno, e.ThreadDesktop, e.InputDesktop)
+}
+
+// IsAccessDenied mówi, czy system odmówił dostępu (zły pulpit albo poziom uprawnień).
+func (e *SendInputError) IsAccessDenied() bool { return e.Errno == syscall.ERROR_ACCESS_DENIED }
 
 // virtualScreen zwraca prostokąt całego pulpitu wirtualnego.
 func virtualScreen() (x, y, w, h int) {
@@ -86,7 +124,7 @@ func sendMouse(in mouseInputT) error {
 	in.typ = inputMouse
 	r, _, e := procSendInput.Call(1, uintptr(unsafe.Pointer(&in)), unsafe.Sizeof(in))
 	if r != 1 {
-		return fmt.Errorf("SendInput(mysz): %v", e)
+		return newSendInputError("mysz", r, e)
 	}
 	return nil
 }
@@ -95,20 +133,32 @@ func sendKey(in keyInputT) error {
 	in.typ = inputKeyboard
 	r, _, e := procSendInput.Call(1, uintptr(unsafe.Pointer(&in)), unsafe.Sizeof(in))
 	if r != 1 {
-		return fmt.Errorf("SendInput(klawisz): %v", e)
+		return newSendInputError("klawisz", r, e)
 	}
 	return nil
 }
 
+func newSendInputError(op string, sent uintptr, e error) *SendInputError {
+	errno, _ := e.(syscall.Errno)
+	in, _ := InputDesktopName()
+	return &SendInputError{Op: op, Errno: errno, Sent: sent, ThreadDesktop: ThreadDesktopName(), InputDesktop: in}
+}
+
 // Move ustawia kursor w punkcie (nx, ny) w skali 0..1 względem monitora.
 func (j *Injector) Move(nx, ny float64) error {
-	px := NormToPixel(nx, j.MonLeft, j.MonW)
-	py := NormToPixel(ny, j.MonTop, j.MonH)
+	left, top, w, h := j.monitor()
+	px := NormToPixel(nx, left, w)
+	py := NormToPixel(ny, top, h)
 	vx, vy, vw, vh := virtualScreen()
-	return sendMouse(mouseInputT{
+	err := sendMouse(mouseInputT{
 		dx: int32(AbsCoord(px, vx, vw)), dy: int32(AbsCoord(py, vy, vh)),
 		flags: evMove | evAbsolute | evVirtDesk,
 	})
+	if err == nil && j.Check != nil {
+		gx, gy := CursorPos()
+		j.Check(px, py, gx, gy)
+	}
+	return err
 }
 
 // Button naciska (down) lub puszcza przycisk myszy: 0 lewy, 1 środkowy, 2 prawy, 3 wstecz, 4 dalej.

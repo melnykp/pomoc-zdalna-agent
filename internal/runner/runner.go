@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/melnykp/pomoc-zdalna-agent/internal/heartbeat"
 	"github.com/melnykp/pomoc-zdalna-agent/internal/identity"
 	"github.com/melnykp/pomoc-zdalna-agent/internal/inventory"
+	"github.com/melnykp/pomoc-zdalna-agent/internal/logtail"
 	"github.com/melnykp/pomoc-zdalna-agent/internal/remote"
 	"github.com/melnykp/pomoc-zdalna-agent/internal/session"
 	"github.com/melnykp/pomoc-zdalna-agent/internal/transport"
@@ -33,6 +35,8 @@ type Options struct {
 	Identity *identity.Identity
 	Log      *slog.Logger
 	Versions wire.Versions
+	// LogDir to katalog dzienników czytanych poleceniem logs.tail; pusty = katalog logs w katalogu danych.
+	LogDir string
 
 	Dial      func(ctx context.Context, url, deviceID string) (transport.Conn, error)
 	Keys      func(cfg config.Config) ([]ed25519.PublicKey, error)
@@ -648,6 +652,24 @@ func (r *Runner) registerCommands() {
 			time.AfterFunc(3*time.Second, r.o.OnRetire)
 		}
 		return json.RawMessage(`{"retiring":true}`), nil
+	})
+
+	// logs.tail: ostatnie linie dzienników agenta i nadzorcy do diagnozy z panelu. Tylko odczyt, wynik bez linii z wrażliwymi
+	// słowami (internal/logtail); agent działa jako SYSTEM, więc czyta pliki zabezpieczone ACL.
+	r.disp.Register(wire.CmdLogsTail, func(_ context.Context, cmd wire.Cmd) (json.RawMessage, error) {
+		var p wire.LogsTailPayload
+		if len(cmd.Payload) > 0 {
+			if err := json.Unmarshal(cmd.Payload, &p); err != nil {
+				return nil, fmt.Errorf("zły ładunek logs.tail: %w", err)
+			}
+		}
+		dir := r.o.LogDir
+		if dir == "" {
+			dir = filepath.Join(config.DataDir(), "logs")
+		}
+		res := logtail.Read(logtail.Options{Dir: dir, Lines: p.Lines, Source: p.Source})
+		res.At = time.Now().UnixMilli()
+		return json.Marshal(res)
 	})
 
 	r.disp.Register(wire.CmdConfigSet, func(_ context.Context, cmd wire.Cmd) (json.RawMessage, error) {

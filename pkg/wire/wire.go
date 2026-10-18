@@ -55,6 +55,7 @@ const (
 	CmdAgentRestart     = "agent.restart"
 	CmdConfigSet        = "config.set"
 	CmdDeviceRetire     = "device.retire"
+	CmdLogsTail         = "logs.tail"
 )
 
 // Powody odmowy w AuthFail.
@@ -207,6 +208,40 @@ type RemoteOpenPayload struct {
 	SessionID          string `json:"session_id"`
 	TechnicianRemoteID string `json:"technician_remote_id"`
 	TTLS               int    `json:"ttl_s"`
+}
+
+// Limity polecenia logs.tail: ostatnie linie dzienników agenta i nadzorcy do diagnozy z panelu, bez udziału klienta.
+const (
+	LogsTailDefaultLines = 200
+	LogsTailMaxLines     = 400
+	// LogsTailMaxBytes to łączny limit tekstu w wyniku (cmd.result idzie w ramce do 256 KB, a wynik trafia do bazy).
+	LogsTailMaxBytes   = 60 * 1024
+	LogsSourceAgent    = "agent"
+	LogsSourceWatchdog = "watchdog"
+	LogsSourceBoth     = "both"
+)
+
+// LogsTailPayload to ładunek CmdLogsTail; zero w polach oznacza wartości domyślne (200 linii, oba dzienniki).
+type LogsTailPayload struct {
+	Lines  int    `json:"lines,omitempty"`
+	Source string `json:"source,omitempty"`
+}
+
+// LogsTailSource to ogon jednego pliku dziennika.
+type LogsTailSource struct {
+	Name      string   `json:"name"`
+	Lines     []string `json:"lines"`
+	Truncated bool     `json:"truncated,omitempty"` // starsze linie obcięto z powodu limitu bajtów
+	Missing   bool     `json:"missing,omitempty"`   // pliku nie ma (jeszcze nie powstał)
+	Error     string   `json:"error,omitempty"`
+}
+
+// LogsTailResult to wynik CmdLogsTail (w cmd.result).
+type LogsTailResult struct {
+	Sources  []LogsTailSource `json:"sources"`
+	Bytes    int              `json:"bytes"`
+	Redacted int              `json:"redacted"` // ile linii zastąpiono znacznikiem (zawierały otp/password/token…)
+	At       int64            `json:"at"`
 }
 
 // RemoteClosePayload to ładunek CmdRemoteClose.

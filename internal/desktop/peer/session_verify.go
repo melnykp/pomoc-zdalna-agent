@@ -129,6 +129,11 @@ func (s *Session) whenVerified(what string, fn func()) {
 // onChannelMessage to wejście z kanałów ctrl i mouse: ramki są odrzucane (z logiem), dopóki weryfikacja DTLS nie przejdzie,
 // a po przejściu działają na tym samym kanale, bez ponownego otwierania.
 func (s *Session) onChannelMessage(label string, raw []byte) {
+	if label == chanMouse {
+		s.inputStats.RxMouse.Add(1)
+	} else {
+		s.inputStats.RxCtrl.Add(1)
+	}
 	if s.inputOff.Load() {
 		s.rejectInput(label, "sesja zakończona")
 		return
@@ -147,6 +152,9 @@ func (s *Session) onChannelMessage(label string, raw []byte) {
 
 // rejectInput loguje odrzucone wejście: pierwsze od razu (Info), potem najwyżej raz na sekundę z licznikiem pominiętych.
 func (s *Session) rejectInput(label, reason string) {
+	if s.inputStats != nil {
+		s.inputStats.NoteReject(reason)
+	}
 	if s.rejectLog == nil {
 		return
 	}

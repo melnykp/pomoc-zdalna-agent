@@ -74,8 +74,12 @@ func retryOpen[T any](ctx context.Context, pol retryPolicy, log *slog.Logger, wh
 			}
 			return v, nil
 		}
-		last = fmt.Errorf("%w (pulpit wejściowy %q)", err, desktop)
-		log.Warn("otwarcie źródła obrazu nieudane", "what", what, "attempt", i, "of", pol.Attempts, "input_desktop", desktop, "err", err)
+		shown := desktop
+		if shown == "" {
+			shown = "niedostępny (OpenInputDesktop odmówił: pulpit zabezpieczony, np. blokada, logowanie albo UAC)"
+		}
+		last = fmt.Errorf("%w (pulpit wejściowy %q)", err, shown)
+		log.Warn("otwarcie źródła obrazu nieudane", "what", what, "attempt", i, "of", pol.Attempts, "input_desktop", shown, "err", err)
 		if retryable != nil && !retryable(err) {
 			break
 		}

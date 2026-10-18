@@ -68,7 +68,13 @@ func launchInUserSession(exe string, log *slog.Logger) (Process, error) {
 		return nil, fmt.Errorf("token użytkownika sesji %d: %w", session, err)
 	}
 	defer tok.Close()
+	return startWithToken(tok, session, exe, log)
+}
 
+// startWithToken tworzy proces pomocnika z podanym tokenem (główny token użytkownika z WTSQueryUserToken albo, w testach,
+// kopia tokenu bieżącego procesu) tak samo jak robi to usługa: pulpit winsta0\default, potoki jako standardowe wejście i wyjście,
+// środowisko użytkownika, bez okna konsoli. Ta sama ścieżka kodu w produkcji i w teście wejścia.
+func startWithToken(tok windows.Token, session uint32, exe string, log *slog.Logger) (Process, error) {
 	var env *uint16
 	if err := windows.CreateEnvironmentBlock(&env, tok, false); err != nil {
 		return nil, fmt.Errorf("środowisko użytkownika: %w", err)

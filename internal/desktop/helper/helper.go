@@ -38,6 +38,7 @@ type Helper struct {
 
 	mu      sync.Mutex
 	session *peer.Session
+	inj     *peer.ThreadInjector
 	done    chan struct{}
 }
 
@@ -52,6 +53,9 @@ func New(in io.Reader, out io.Writer, version string) *Helper {
 func (h *Helper) Run(ctx context.Context) error {
 	proc.SetDPIAware()
 	proc.HighResTimer()
+	// Kontekst procesu do dziennika od razu przy starcie: token, poziom integralności i pulpity (CreateProcessAsUser z usługi
+	// potrafi dać inny kontekst niż zwykłe uruchomienie).
+	h.log.Info("pomocnik uruchomiony", "version", h.version, "context", winput.Context().String())
 	displays, err := capture.ListDisplays()
 	if err != nil {
 		h.send(ipc.DesktopMsg{Kind: ipc.DesktopState, State: ipc.StateFailed, Error: "lista monitorów: " + err.Error()})
@@ -142,9 +146,24 @@ func (h *Helper) start(m ipc.DesktopMsg, displays []capture.Display) error {
 	eng := engine.New(engine.Config{Monitor: mon, FPS: fps}, h.log)
 	var inj peer.Injector
 	var winj *winput.Injector
+	var probe func() (any, any)
+	stats := &peer.InputStats{}
 	if m.Control {
 		winj = injectorFor(displays[mon])
-		inj = winj
+		// Kontrola po każdym ruchu myszy: kursor ma być tam, dokąd go wysłano. Rozbieżność przy sukcesie SendInput to ślad
+		// po cichym odrzuceniu wejścia (UIPI, zły pulpit).
+		winj.Check = func(wx, wy, gx, gy int) {
+			if absInt(wx-gx) > 2 || absInt(wy-gy) > 2 {
+				stats.NoteMismatch(fmt.Sprintf("cel (%d,%d), kursor (%d,%d)", wx, wy, gx, gy))
+			}
+		}
+		// Całe wstrzykiwanie na jednym przypiętym wątku dołączonym do pulpitu wejściowego (SendInput działa na pulpicie wątku).
+		ti := peer.NewThreadInjector(winj, h.log)
+		h.mu.Lock()
+		h.inj = ti
+		h.mu.Unlock()
+		inj = ti
+		probe = ti.Probe
 	}
 	sessionID := m.SessionID
 	var infos []peer.DisplayInfo
@@ -155,6 +174,8 @@ func (h *Helper) start(m ipc.DesktopMsg, displays []capture.Display) error {
 		ICEServers:        m.ICEServers,
 		Engine:            eng,
 		Injector:          inj,
+		Input:             stats,
+		Probe:             probe,
 		Log:               h.log,
 		Displays:          infos,
 		RemoteFingerprint: m.Fingerprint,
@@ -170,7 +191,8 @@ func (h *Helper) start(m ipc.DesktopMsg, displays []capture.Display) error {
 		OnConfig: func(monitor, _ *int) {
 			// Po zmianie monitora współrzędne 0..1 widza odnoszą się do nowego monitora.
 			if monitor != nil && winj != nil && *monitor >= 0 && *monitor < len(displays) {
-				*winj = *injectorFor(displays[*monitor])
+				d := displays[*monitor]
+				winj.SetMonitor(int(d.Left), int(d.Top), d.Width()&^1, d.Height()&^1)
 			}
 		},
 	})
@@ -194,6 +216,13 @@ func injectorFor(d capture.Display) *winput.Injector {
 	return &winput.Injector{MonLeft: int(d.Left), MonTop: int(d.Top), MonW: d.Width() &^ 1, MonH: d.Height() &^ 1}
 }
 
+func absInt(v int) int {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
 func (h *Helper) stop() {
 	h.mu.Lock()
 	s := h.session
@@ -208,6 +237,10 @@ func (h *Helper) stop() {
 func (h *Helper) finish() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.inj != nil {
+		h.inj.Close()
+		h.inj = nil
+	}
 	select {
 	case <-h.done:
 	default:

@@ -40,7 +40,7 @@ func (t *timedInjector) note(down bool) error {
 // bareSession buduje sesję bez pion: tylko to, czego używa end() i onInput().
 func bareSession(inj Injector) *Session {
 	eng := engine.New(engine.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	return &Session{o: Options{Engine: eng, Injector: inj}, log: slog.New(slog.NewTextHandler(io.Discard, nil)), pressd: NewPressed()}
+	return &Session{o: Options{Engine: eng, Injector: inj}, log: slog.New(slog.NewTextHandler(io.Discard, nil)), pressd: NewPressed(), inputStats: &InputStats{}}
 }
 
 func TestEndReleasesKeysBeforeWaitingForSlowEngine(t *testing.T) {

@@ -4,6 +4,7 @@ package peer
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -319,7 +320,7 @@ func bareVerifySession(t *testing.T, remoteFP string, cert func() []byte, log *s
 	inj := &recInjector{}
 	return &Session{
 		o: Options{Engine: eng, Injector: inj}, log: log, pressd: NewPressed(), remoteFP: remoteFP,
-		remoteCert: cert, verifyPoll: 5 * time.Millisecond, rejectLog: newRateLimiter(time.Second), sendLog: newRateLimiter(time.Second),
+		remoteCert: cert, verifyPoll: 5 * time.Millisecond, rejectLog: newRateLimiter(time.Second), sendLog: newRateLimiter(time.Second), inputStats: &InputStats{}, chanOpen: map[string]bool{},
 	}
 }
 
@@ -469,5 +470,87 @@ func TestViewOnlySessionLogsWhyInputIsIgnored(t *testing.T) {
 	defer mu.Unlock()
 	if len(recs) != 1 || !strings.HasPrefix(recs[0], "INFO wejście odrzucone") {
 		t.Fatalf("wpisy: %v", recs)
+	}
+}
+
+// inputMsg czeka na komunikat "input" z kanału meta spełniający warunek.
+func waitInputMsg(t *testing.T, h *harness, d time.Duration, cond func(InputStatsMsg) bool) InputStatsMsg {
+	t.Helper()
+	deadline := time.After(d)
+	for {
+		select {
+		case raw := <-h.meta:
+			if !strings.Contains(raw, `"t":"input"`) {
+				continue
+			}
+			var m InputStatsMsg
+			if err := json.Unmarshal([]byte(raw), &m); err != nil {
+				t.Fatal(err)
+			}
+			if cond(m) {
+				return m
+			}
+		case <-deadline:
+			t.Fatal("nie doczekano komunikatu o wejściu spełniającego warunek")
+			return InputStatsMsg{}
+		}
+	}
+}
+
+// Widz sam pokazuje, na którym etapie ginie wejście: liczniki odebrane/odrzucone/wstrzyknięte/błędy, kanały i weryfikacja DTLS.
+func TestInputStatsReachViewerThroughMetaChannel(t *testing.T) {
+	h := newHarness(t, func(real func() []byte) func() []byte { return real }, 20*time.Millisecond, true)
+	h.send(h.ctrl, `{"t":"kd","c":"ShiftLeft"}`)
+	h.send(h.ctrl, `{"t":"ku","c":"ShiftLeft"}`)
+	h.send(h.mouse, `{"t":"mm","x":0.5,"y":0.5}`)
+	h.send(h.ctrl, `{"t":"ping","tc":1}`) // nie jest zdarzeniem wejścia: odebrane, ale niewstrzykiwane
+
+	m := waitInputMsg(t, h, 10*time.Second, func(m InputStatsMsg) bool { return m.Injected >= 3 })
+	if m.Rx.Ctrl < 3 || m.Rx.Mouse < 1 || m.Errors != 0 || m.Rejected != 0 || m.Injected != 3 {
+		t.Fatalf("liczniki: %+v", m)
+	}
+	for _, ch := range []string{"ctrl", "mouse", "cursor", "meta"} {
+		if !m.Channels[ch] {
+			t.Fatalf("kanał %s powinien być otwarty: %+v", ch, m.Channels)
+		}
+	}
+	if m.DTLS != "zgodny" || !m.Control {
+		t.Fatalf("stan: dtls=%q control=%v", m.DTLS, m.Control)
+	}
+
+	// Błąd SendInput trafia do widza razem z treścią (kod systemu i pulpity w komunikacie błędu).
+	h.inj.mu.Lock()
+	h.inj.fail = errors.New("SendInput(klawisz): przyjęto 0 z 1, błąd systemu 5, pulpit wątku \"Default\", pulpit wejściowy \"Winlogon\"")
+	h.inj.mu.Unlock()
+	h.send(h.ctrl, `{"t":"kd","c":"KeyA"}`)
+	m = waitInputMsg(t, h, 10*time.Second, func(m InputStatsMsg) bool { return m.Errors >= 1 })
+	if !strings.Contains(m.LastError, "Winlogon") || m.Injected != 3 {
+		t.Fatalf("błąd wstrzykiwania: %+v", m)
+	}
+}
+
+// Przed weryfikacją odrzucone ramki widać w licznikach (rx rośnie, injected nie), z powodem.
+func TestInputStatsShowRejectedFramesBeforeVerification(t *testing.T) {
+	var gate atomic.Bool
+	h := newHarness(t, func(real func() []byte) func() []byte {
+		return func() []byte {
+			if !gate.Load() {
+				return nil
+			}
+			return real()
+		}
+	}, 20*time.Millisecond, true)
+	for i := 0; i < 4; i++ {
+		h.send(h.ctrl, `{"t":"kd","c":"KeyA"}`)
+	}
+	time.Sleep(200 * time.Millisecond)
+	snap := h.sess.inputStats.Snapshot()
+	if snap.Rx.Ctrl != 4 || snap.Rejected != 4 || snap.Injected != 0 || !strings.Contains(snap.LastReject, "DTLS") {
+		t.Fatalf("przed weryfikacją: %+v", snap)
+	}
+	gate.Store(true)
+	m := waitInputMsg(t, h, 10*time.Second, func(m InputStatsMsg) bool { return m.DTLS == "zgodny" })
+	if m.Rejected != 4 || m.Injected != 0 {
+		t.Fatalf("po weryfikacji liczniki odrzuconych zostają: %+v", m)
 	}
 }
